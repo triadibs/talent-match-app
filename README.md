@@ -86,7 +86,7 @@ talent-match-app/
 This is Step 3 of a Data Analyst case study focusing on:
 - Success pattern discovery (Step 1)
 - SQL matching logic (Step 2)
-- AI-powered dashboard (Step 3) ← You are here
+- AI-powered dashboard (Step 3) 
 
 ## License
 Internal use only - Company X
