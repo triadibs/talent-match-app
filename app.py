@@ -155,116 +155,61 @@ def show_home_page():
 
 def show_create_vacancy_page():
     """Page for creating new job vacancy"""
+    
     st.markdown("## ➕ Create New Job Vacancy")
     st.markdown("Define the role and select benchmark employees to find the best matches.")
-
+    
     # Form
     with st.form("vacancy_form"):
         st.markdown("### 📝 Job Details")
-
+        
         col1, col2 = st.columns(2)
-
+        
         with col1:
             role_name = st.text_input(
                 "Role Name *",
-                placeholder="e.g., Data Analyst, Product Manager",
-                help="The job title for this vacancy"
+                placeholder="e.g., Data Analyst, Product Manager"
             )
-
             job_level = st.selectbox(
                 "Job Level *",
                 ["Entry", "Junior", "Middle", "Senior", "Lead", "Manager", "Director"],
                 index=2
             )
-
+        
         with col2:
-            # Get high performers for selection
-            high_performers_df = pd.DataFrame()
-            try:
-                high_performers_df = db.get_high_performers()
-            except Exception as e:
-                st.error(f"Failed to load high performers: {e}")
-
+            high_performers_df = db.get_high_performers()
+            
             if high_performers_df.empty:
-                st.error("No high performers (rating 5) found in the database!")
+                st.error("No high performers found!")
                 selected_employees = []
             else:
-                # Format for multiselect
                 employee_options = high_performers_df.apply(
-                    lambda x: f"{x['employee_id']} - {x['fullname']} ({x.get('position', '')})",
+                    lambda x: f"{x['employee_id']} - {x['fullname']} ({x['position']})", 
                     axis=1
                 ).tolist()
-
+                
                 selected_options = st.multiselect(
-                    "Select Benchmark Employees (High Performers) *",
+                    "Select Benchmark Employees *",
                     options=employee_options,
-                    help="Choose 2-5 employees with rating 5 who exemplify success in this role",
                     max_selections=5
                 )
-
-                # Extract employee IDs
                 selected_employees = [opt.split(' - ')[0] for opt in selected_options]
-
+        
         role_purpose = st.text_area(
             "Role Purpose *",
-            placeholder="1-2 sentence summary of what this role does and why it matters...",
-            height=100,
-            help="Brief description of the role's main purpose and impact"
+            placeholder="1-2 sentence summary...",
+            height=100
         )
-
-        st.markdown("### ⚙️ Advanced Options (Optional)")
-
-        use_custom_weights = st.checkbox("Use custom TGV weights")
-
-        custom_weights = None
-        if use_custom_weights:
-            st.info("Adjust weights for each Talent Group Variable (TGV). Default values from Step 1 analysis.")
-            col1, col2 = st.columns(2)
-            with col1:
-                w_interpersonal = st.slider("Interpersonal Skills", 0.0, 1.0, 0.612, 0.001)
-                w_leadership = st.slider("Leadership Competencies", 0.0, 1.0, 0.314, 0.001)
-                w_execution = st.slider("Execution Competencies", 0.0, 1.0, 0.041, 0.001)
-                w_attention = st.slider("Attention Processing", 0.0, 1.0, 0.016, 0.001)
-            with col2:
-                w_cognitive = st.slider("Cognitive Ability", 0.0, 1.0, 0.009, 0.001)
-                w_experience = st.slider("Experience", 0.0, 1.0, 0.005, 0.001)
-                w_work_pref = st.slider("Work Preferences", 0.0, 1.0, 0.003, 0.001)
-
-            # Normalize weights
-            total_weight = (
-                w_interpersonal + w_leadership + w_execution + w_attention
-                + w_cognitive + w_experience + w_work_pref
-            )
-
-            if total_weight > 0:
-                custom_weights = {
-                    "TGV_weights": {
-                        "interpersonal_skills": round(w_interpersonal / total_weight, 4),
-                        "leadership_competencies": round(w_leadership / total_weight, 4),
-                        "execution_competencies": round(w_execution / total_weight, 4),
-                        "attention_processing": round(w_attention / total_weight, 4),
-                        "cognitive_ability": round(w_cognitive / total_weight, 4),
-                        "experience": round(w_experience / total_weight, 4),
-                        "work_preferences": round(w_work_pref / total_weight, 4)
-                    }
-                }
-                st.caption(f"Total weight (normalized): {total_weight:.3f} → 1.000")
-
-        # Submit button (removed deprecated parameter)
-        submitted = st.form_submit_button("🚀 Create Vacancy & Run Matching")
-
+        
+        submitted = st.form_submit_button("🚀 Create Vacancy & Run Matching", type="primary")
+        
         if submitted:
-            # Validation
-            if not role_name or not role_purpose:
-                st.error("❌ Please fill in all required fields (marked with *)")
-                return
-
-            if len(selected_employees) < 2:
-                st.error("❌ Please select at least 2 benchmark employees")
-                return
-
-            # Process
-            with st.spinner("🔄 Creating vacancy and running AI analysis..."):
+            if not role_name or not role_purpose or len(selected_employees) < 2:
+                st.error("❌ Please fill all required fields and select at least 2 benchmarks")
+                st.stop()
+            
+            # PROCESS
+            with st.spinner("🔄 Creating vacancy..."):
                 try:
                     # 1. Insert vacancy
                     vacancy_id = db.insert_vacancy(
@@ -272,152 +217,156 @@ def show_create_vacancy_page():
                         job_level=job_level,
                         role_purpose=role_purpose,
                         selected_talent_ids=selected_employees,
-                        weights_config=custom_weights
+                        weights_config=None
                     )
-
-                    # 2. Generate AI job profile
-                    with st.spinner("🤖 Generating job profile with AI..."):
-                        job_profile = generate_job_profile(
-                            role_name=role_name,
-                            job_level=job_level,
-                            role_purpose=role_purpose,
-                            benchmark_employees=high_performers_df[
-                                high_performers_df['employee_id'].isin(selected_employees)
-                            ] if not high_performers_df.empty else pd.DataFrame()
-                        )
-
-                    # 3. Run matching SQL
-                    with st.spinner("📊 Computing talent matches..."):
-                        matching_results = db.run_matching_query(vacancy_id)
-
-                    # Save to session state
-                    st.session_state.vacancy_created = True
-                    st.session_state.job_vacancy_id = vacancy_id
-                    st.session_state.matching_results = matching_results
-                    st.session_state.job_profile = job_profile
-
-                    # Success message
-                    st.success(f"✅ Vacancy created successfully! (ID: {vacancy_id})")
-                    st.balloons()
-
-                    # Show preview
-                    st.markdown("---")
-                    st.markdown("### 🎯 AI-Generated Job Profile")
-
-                    col1, col2 = st.columns([2, 1])
-
-                    with col1:
-                        st.markdown("**Job Requirements:**")
-                        st.write(job_profile.get('requirements', 'N/A'))
-
-                        st.markdown("**Job Description:**")
-                        st.write(job_profile.get('description', 'N/A'))
-
-                    with col2:
-                        st.markdown("**Key Competencies:**")
-                        competencies = job_profile.get('competencies', 'N/A')
-                        if isinstance(competencies, list):
-                            for comp in competencies:
-                                st.markdown(f"• {comp}")
-                        else:
-                            st.write(competencies)
-
-                    st.markdown("---")
-                    st.info("👉 Go to **'View Results'** to see the ranked talent list and detailed analytics!")
-
+                    
+                    st.success(f"✅ Vacancy #{vacancy_id} created!")
+                    
                 except Exception as e:
-                    st.error(f"❌ Error: {str(e)}")
+                    st.error(f"❌ Error creating vacancy: {e}")
+                    st.stop()
+            
+            # 2. Generate AI profile
+            with st.spinner("🤖 Generating job profile with AI..."):
+                try:
+                    job_profile = generate_job_profile(
+                        role_name=role_name,
+                        job_level=job_level,
+                        role_purpose=role_purpose,
+                        benchmark_employees=high_performers_df[
+                            high_performers_df['employee_id'].isin(selected_employees)
+                        ]
+                    )
+                except Exception as e:
+                    st.warning(f"AI generation failed: {e}. Using fallback.")
+                    job_profile = generate_fallback_profile(role_name, job_level, role_purpose)
+            
+            # 3. Run matching SQL
+            with st.spinner("📊 Computing talent matches (this may take 30-60 seconds)..."):
+                try:
+                    matching_results = db.run_matching_query(vacancy_id)
+                    
+                    if matching_results.empty:
+                        st.error("❌ Matching returned no results. Check your data.")
+                        st.stop()
+                    
+                    st.success(f"✅ Matched {len(matching_results)} records!")
+                    
+                except Exception as e:
+                    st.error(f"❌ Matching error: {e}")
                     st.exception(e)
-
+                    st.stop()
+            
+            # 4. Save to session state
+            st.session_state.vacancy_created = True
+            st.session_state.job_vacancy_id = vacancy_id
+            st.session_state.matching_results = matching_results
+            st.session_state.job_profile = job_profile
+            
+            # 5. DISPLAY AI JOB PROFILE (THIS IS CRITICAL!)
+            st.balloons()
+            st.markdown("---")
+            st.markdown("### 🎯 AI-Generated Job Profile")
+            
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                st.markdown("**📋 Job Requirements:**")
+                with st.container():
+                    st.write(job_profile.get('requirements', 'N/A'))
+                
+                st.markdown("**📝 Job Description:**")
+                with st.container():
+                    st.write(job_profile.get('description', 'N/A'))
+            
+            with col2:
+                st.markdown("**🎯 Key Competencies:**")
+                competencies = job_profile.get('competencies', [])
+                if isinstance(competencies, list):
+                    for comp in competencies:
+                        st.markdown(f"• {comp}")
+                else:
+                    st.write(competencies)
+            
+            st.markdown("---")
+            st.info("👉 Go to **'View Results'** or **'Analytics'** to see detailed insights!")
 
 def show_results_page():
-    """
-    Page untuk melihat hasil matching (ranked candidates).
-    Pastikan fungsi ini didefinisikan sebelum dipanggil di main().
-    """
-    st.markdown("## 📊 View Results")
-
-    # Cek session state
-    if not st.session_state.get('vacancy_created') or st.session_state.get('matching_results') is None:
-        st.warning("⚠️ Tidak ada hasil matching. Silakan buat vacancy terlebih dahulu di menu '➕ Create Vacancy'.")
+    """Page showing matching results"""
+    
+    st.markdown("## 📊 Talent Matching Results")
+    
+    # Check session state
+    if not st.session_state.get('vacancy_created', False):
+        st.warning("⚠️ No vacancy created yet. Create one or load existing.")
+        
+        # Load existing vacancy
+        existing = db.get_recent_vacancies(20)
+        if not existing.empty:
+            selected = st.selectbox("Select vacancy:", existing['job_vacancy_id'],
+                                   format_func=lambda x: f"ID {x}: {existing[existing['job_vacancy_id']==x]['role_name'].iloc[0]}")
+            
+            if st.button("📥 Load Results"):
+                with st.spinner("Loading..."):
+                    st.session_state.job_vacancy_id = selected
+                    st.session_state.matching_results = db.run_matching_query(selected)
+                    st.session_state.vacancy_created = True
+                    st.rerun()
         return
-
-    results_df = st.session_state.matching_results.copy()
-    vacancy_id = st.session_state.get('job_vacancy_id')
-
-    st.markdown(f"### Hasil Matching — Vacancy ID: **{vacancy_id}**")
-
-    # Upayakan kolom skor ada
-    if 'final_match_rate' in results_df.columns:
-        results_df['final_match_rate'] = pd.to_numeric(results_df['final_match_rate'], errors='coerce')
-    elif 'final_match_rate_percentage' in results_df.columns:
-        results_df['final_match_rate'] = pd.to_numeric(results_df['final_match_rate_percentage'], errors='coerce')
-    # else: tampilkan apa adanya
-
-    # Susun preview
-    try:
-        display_df = results_df.sort_values('final_match_rate', ascending=False).head(100)
-    except Exception:
-        display_df = results_df.head(100)
-
-    # Pilih kolom yang ditampilkan bila ada
-    show_cols = [c for c in ['employee_id', 'fullname', 'directorate', 'role', 'grade', 'final_match_rate'] if c in display_df.columns]
-
-    st.markdown("#### 🔎 Top Matches (preview)")
-    if display_df.empty:
-        st.warning("Hasil matching kosong.")
+    
+    # Get data
+    results_df = st.session_state.matching_results
+    vacancy_id = st.session_state.job_vacancy_id
+    
+    if results_df is None or results_df.empty:
+        st.error("No results available.")
         return
-
-    try:
-        st.dataframe(display_df[show_cols] if show_cols else display_df, width='stretch')
-    except Exception:
-        st.dataframe(display_df[show_cols] if show_cols else display_df)
-
-    # Detail kandidat
-    st.markdown("---")
-    st.markdown("### Detail Kandidat")
-    candidate_ids = display_df['employee_id'].drop_duplicates().tolist() if 'employee_id' in display_df.columns else []
-
-    if candidate_ids:
-        selected = st.selectbox(
-            "Pilih Employee ID untuk melihat detail:",
-            options=candidate_ids,
-            format_func=lambda x: f"{x} - {display_df[display_df.get('employee_id')==x]['fullname'].iloc[0] if 'fullname' in display_df.columns else ''}"
-        )
-
-        candidate_row = display_df[display_df.get('employee_id') == selected]
-        st.markdown("#### Profil & Skor")
-        st.table(candidate_row.T)
-
-        # Visualisasi (jika utils tersedia)
-        try:
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("##### TGV Radar")
-                fig_radar = plot_tgv_radar(results_df, selected)
-                st.plotly_chart(fig_radar, width='stretch')
-            with col2:
-                st.markdown("##### TV Heatmap")
-                fig_heatmap = plot_tv_heatmap(results_df, selected)
-                st.plotly_chart(fig_heatmap, width='stretch')
-        except Exception as e:
-            st.info("Visualisasi detail kandidat tidak tersedia: " + str(e))
-    else:
-        st.info("Employee ID tidak ditemukan di hasil. Tabel di atas menunjukkan apa yang tersedia.")
-
-    st.markdown("---")
-    # Download CSV
-    try:
-        csv = results_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Download full results as CSV",
-            data=csv,
-            file_name=f"matching_results_vacancy_{vacancy_id}.csv",
-            mime="text/csv"
-        )
-    except Exception as e:
-        st.error("Gagal menyediakan download: " + str(e))
-
+    
+    # Create summary
+    summary_df = results_df.groupby('employee_id').agg({
+        'fullname': 'first',
+        'directorate': 'first',
+        'role': 'first',
+        'grade': 'first',
+        'final_match_rate': 'first'
+    }).reset_index()
+    
+    summary_df = summary_df.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
+    summary_df['final_match_rate_percentage'] = pd.to_numeric(summary_df['final_match_rate_percentage'], errors='coerce')
+    summary_df = summary_df.dropna(subset=['final_match_rate_percentage'])
+    summary_df = summary_df.sort_values('final_match_rate_percentage', ascending=False)
+    
+    # Display
+    st.markdown("### 🏆 Top 20 Candidates")
+    
+    st.dataframe(
+        summary_df.head(20),
+        column_config={
+            "employee_id": "ID",
+            "fullname": "Name",
+            "directorate": "Directorate",
+            "role": "Current Role",
+            "grade": "Grade",
+            "final_match_rate_percentage": st.column_config.ProgressColumn(
+                "Match Score",
+                format="%.2f%%",
+                min_value=0,
+                max_value=100
+            )
+        },
+        hide_index=True,
+        use_container_width=True,
+        height=600
+    )
+    
+    # Download
+    csv = summary_df.to_csv(index=False)
+    st.download_button(
+        "📥 Download Results (CSV)",
+        csv,
+        f"talent_match_results_{vacancy_id}.csv",
+        "text/csv"
+    )
 
 def show_analytics_page():
     """Page with visualizations and analytics"""
