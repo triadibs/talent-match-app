@@ -163,7 +163,7 @@ class DatabaseManager:
     # ---------------------------------------------
     # RUN MATCHING PIPELINE
     # ---------------------------------------------
-        def run_matching_query(self, job_vacancy_id: int) -> pd.DataFrame:
+    def run_matching_query(self, job_vacancy_id: int) -> pd.DataFrame:
         """
         Run COMPLETE matching pipeline: create all temp tables, then return detailed results.
         This executes the FULL SQL workflow from your Step 2.
