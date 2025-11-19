@@ -557,20 +557,7 @@ def show_analytics_page():
     }).reset_index()
     
     summary_df = summary_df.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
-    
-    # 🔥 CRITICAL FIX: Convert to numeric and drop NaN
-    summary_df['final_match_rate_percentage'] = pd.to_numeric(
-        summary_df['final_match_rate_percentage'], 
-        errors='coerce'
-    )
-    summary_df = summary_df.dropna(subset=['final_match_rate_percentage'])
-    
     summary_df = summary_df.sort_values('final_match_rate_percentage', ascending=False).head(100)
-    
-    # Check if we have data
-    if summary_df.empty:
-        st.warning("⚠️ No valid matching results found.")
-        return
     
     # Key insights
     st.markdown("### 🔍 Key Insights")
@@ -600,19 +587,13 @@ def show_analytics_page():
     
     with col1:
         st.markdown("#### 📊 Match Score Distribution")
-        try:
-            fig_dist = plot_match_distribution(summary_df)
-            st.plotly_chart(fig_dist, use_container_width=True)
-        except Exception as e:
-            st.error(f"Error creating distribution chart: {e}")
+        fig_dist = plot_match_distribution(summary_df)
+        st.plotly_chart(fig_dist, use_container_width=True)
     
     with col2:
         st.markdown("#### 🏆 Top 10 Candidates")
-        try:
-            fig_top = plot_top_candidates(summary_df, top_n=10)
-            st.plotly_chart(fig_top, use_container_width=True)
-        except Exception as e:
-            st.error(f"Error creating top candidates chart: {e}")
+        fig_top = plot_top_candidates(summary_df, top_n=10)
+        st.plotly_chart(fig_top, use_container_width=True)
     
     st.markdown("---")
     
@@ -636,27 +617,18 @@ def show_analytics_page():
     
     with col1:
         st.markdown("#### 🎯 TGV Radar Profile")
-        try:
-            fig_radar = plot_tgv_radar(results_df, selected_employee)
-            st.plotly_chart(fig_radar, use_container_width=True)
-        except Exception as e:
-            st.error(f"Error creating radar chart: {e}")
+        fig_radar = plot_tgv_radar(results_df, selected_employee)
+        st.plotly_chart(fig_radar, use_container_width=True)
     
     with col2:
         st.markdown("#### 🔥 TV Heatmap (Top TGVs)")
-        try:
-            fig_heatmap = plot_tv_heatmap(results_df, selected_employee)
-            st.plotly_chart(fig_heatmap, use_container_width=True)
-        except Exception as e:
-            st.error(f"Error creating heatmap: {e}")
+        fig_heatmap = plot_tv_heatmap(results_df, selected_employee)
+        st.plotly_chart(fig_heatmap, use_container_width=True)
     
     st.markdown("---")
     
     # Strengths & Gaps
     st.markdown("### ✅ Strengths & Gaps Analysis")
     
-    try:
-        fig_strengths_gaps = plot_strengths_gaps(results_df, selected_employee)
-        st.plotly_chart(fig_strengths_gaps, use_container_width=True)
-    except Exception as e:
-        st.error(f"Error creating strengths/gaps chart: {e}")
+    fig_strengths_gaps = plot_strengths_gaps(results_df, selected_employee)
+    st.plotly_chart(fig_strengths_gaps, use_container_width=True)
