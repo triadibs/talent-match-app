@@ -29,9 +29,6 @@ class DatabaseManager:
             st.error(f"Database configuration error: {e}")
             raise
 
-    # ---------------------------------------------
-    # INTERNAL CONNECTION CHECK
-    # ---------------------------------------------
     def _test_connection(self):
         """Test database connection"""
         try:
@@ -47,18 +44,22 @@ class DatabaseManager:
     # ---------------------------------------------
     # GENERIC QUERY FUNCTION
     # ---------------------------------------------
-    def execute_query(self, query: str, params: tuple = None, fetch: bool = True):
-        """Execute SQL query and return results"""
+    def execute_query(self, query: str, params: tuple = None, fetch: bool = True) -> pd.DataFrame:
+        """Execute SQL query and return results (returns empty DataFrame if no rows)."""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(query, params)
+                # Handle params None explicitly to avoid passing None to execute
+                if params:
+                    cur.execute(query, params)
+                else:
+                    cur.execute(query)
 
                 if fetch:
                     rows = cur.fetchall()
                     return pd.DataFrame(rows) if rows else pd.DataFrame()
                 else:
                     conn.commit()
-                    return None
+                    return pd.DataFrame()
 
     # ---------------------------------------------
     # HOME PAGE QUERIES
@@ -66,7 +67,7 @@ class DatabaseManager:
     def get_total_employees(self) -> int:
         query = "SELECT COUNT(*) as count FROM employees"
         result = self.execute_query(query)
-        return result['count'].iloc[0] if not result.empty else 0
+        return int(result['count'].iloc[0]) if not result.empty else 0
 
     def get_high_performers_count(self) -> int:
         query = """
@@ -76,12 +77,12 @@ class DatabaseManager:
         AND year = (SELECT MAX(year) FROM performance_yearly)
         """
         result = self.execute_query(query)
-        return result['count'].iloc[0] if not result.empty else 0
+        return int(result['count'].iloc[0]) if not result.empty else 0
 
     def get_total_vacancies(self) -> int:
         query = "SELECT COUNT(*) as count FROM talent_benchmarks"
         result = self.execute_query(query)
-        return result['count'].iloc[0] if not result.empty else 0
+        return int(result['count'].iloc[0]) if not result.empty else 0
 
     def get_recent_vacancies(self, limit: int = 5) -> pd.DataFrame:
         query = f"""
@@ -94,9 +95,10 @@ class DatabaseManager:
             array_length(selected_talent_ids, 1) AS benchmark_count
         FROM talent_benchmarks
         ORDER BY created_at DESC
-        LIMIT {limit}
+        LIMIT %s
         """
-        return self.execute_query(query)
+        # parameterize limit
+        return self.execute_query(query, params=(limit,))
 
     # ---------------------------------------------
     # HIGH PERFORMER LIST
@@ -149,7 +151,7 @@ class DatabaseManager:
                     (
                         role_name,
                         job_level,
-                        role_purpose,   # ✔ FIXED (bukan job_purpose)
+                        role_purpose,
                         selected_talent_ids,
                         json_data
                     )
@@ -162,42 +164,48 @@ class DatabaseManager:
     # RUN MATCHING PIPELINE
     # ---------------------------------------------
     def run_matching_query(self, job_vacancy_id: int) -> pd.DataFrame:
-        """Runs the entire matching SQL pipeline"""
+        """
+        Attempts to run the final select of the matching pipeline.
+        If the pipeline temporary tables are not present (or SQL fails),
+        falls back to get_summary_results to avoid crashing the app.
+        """
+        final_sql = """
+        SELECT
+          tm.employee_id,
+          tm.fullname,
+          tm.directorate,
+          tm.role,
+          tm.grade,
+          tm.tgv_name,
+          tm.tv_name,
+          ROUND(tm.baseline_score::numeric, 2) AS baseline_score,
+          ROUND(tm.user_score::numeric, 2) AS user_score,
+          ROUND(tm.tv_match_rate::numeric, 2) AS tv_match_rate,
+          ROUND(tgv.tgv_match_rate::numeric, 4) AS tgv_match_rate,
+          ROUND(fa.final_match_rate::numeric, 4) AS final_match_rate
+        FROM tb_tv_match_calc tm
+        LEFT JOIN tb_tgv_with_weights tgv
+          ON tgv.employee_id = tm.employee_id 
+         AND tgv.tgv_name = tm.tgv_name
+        LEFT JOIN tb_final_aggregation fa 
+          ON fa.employee_id = tm.employee_id
+        WHERE tm.baseline_score IS NOT NULL
+        ORDER BY fa.final_match_rate DESC NULLS LAST, 
+                 tm.employee_id, tm.tgv_name, tm.tv_name
+        """
 
-        with self.get_connection() as conn:
-            cur = conn.cursor()
-
-            # (SQL temp table pipeline tetap sama seperti versi Anda sebelumnya)
-            # ... masukkan seluruh SQL di sini ...
-
-            # FINAL SELECT
-            final_sql = """
-            SELECT
-              tm.employee_id,
-              tm.fullname,
-              tm.directorate,
-              tm.role,
-              tm.grade,
-              tm.tgv_name,
-              tm.tv_name,
-              ROUND(tm.baseline_score::numeric, 2) AS baseline_score,
-              ROUND(tm.user_score::numeric, 2) AS user_score,
-              ROUND(tm.tv_match_rate::numeric, 2) AS tv_match_rate,
-              ROUND(tgv.tgv_match_rate::numeric, 4) AS tgv_match_rate,
-              ROUND(fa.final_match_rate::numeric, 4) AS final_match_rate
-            FROM tb_tv_match_calc tm
-            LEFT JOIN tb_tgv_with_weights tgv
-              ON tgv.employee_id = tm.employee_id 
-             AND tgv.tgv_name = tm.tgv_name
-            LEFT JOIN tb_final_aggregation fa 
-              ON fa.employee_id = tm.employee_id
-            WHERE tm.baseline_score IS NOT NULL
-            ORDER BY fa.final_match_rate DESC NULLS LAST, 
-                     tm.employee_id, tm.tgv_name, tm.tv_name
-            """
-
-            df = pd.read_sql_query(final_sql, conn)
-            return df
+        try:
+            with self.get_connection() as conn:
+                # If you have a multi-step SQL pipeline, it should be executed
+                # here in the same connection before final_sql (commented out
+                # in your current code). If not implemented, final_sql may fail.
+                df = pd.read_sql_query(final_sql, conn)
+                return df
+        except Exception as e:
+            # Log the exception to Streamlit so developer can inspect logs
+            st.warning(f"Matching pipeline final select failed: {e}. Falling back to summary results.")
+            # Fallback: return summary results which are likely pre-aggregated
+            return self.get_summary_results(job_vacancy_id, limit=500)
 
     # ---------------------------------------------
     # SUMMARY RESULTS
@@ -215,11 +223,11 @@ class DatabaseManager:
         FROM tb_final_aggregation fa
         WHERE fa.final_match_rate IS NOT NULL
         ORDER BY fa.final_match_rate DESC
-        LIMIT {limit}
+        LIMIT %s
         """
-        return self.execute_query(query)
+        return self.execute_query(query, params=(limit,))
 
     def get_vacancy_info(self, job_vacancy_id: int) -> Dict:
-        query = f"SELECT * FROM talent_benchmarks WHERE job_vacancy_id = {job_vacancy_id}"
-        result = self.execute_query(query)
+        query = "SELECT * FROM talent_benchmarks WHERE job_vacancy_id = %s"
+        result = self.execute_query(query, params=(job_vacancy_id,))
         return result.iloc[0].to_dict() if not result.empty else {}
