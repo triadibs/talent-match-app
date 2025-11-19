@@ -536,84 +536,100 @@ def show_results_page():
 
 def show_analytics_page():
     """Page with visualizations and analytics"""
-
+    
     st.markdown("## 📈 Analytics & Insights")
-
+    
     # Check if results available
     if not st.session_state.vacancy_created or st.session_state.matching_results is None:
         st.warning("⚠️ No results available. Please create a vacancy first.")
         return
-
+    
     results_df = st.session_state.matching_results
     vacancy_id = st.session_state.job_vacancy_id
-    summary_df = db.get_summary_results(vacancy_id, limit=100)
-
+    
+    # COMPUTE summary from detailed results
+    summary_df = results_df.groupby('employee_id').agg({
+        'fullname': 'first',
+        'directorate': 'first',
+        'role': 'first',
+        'grade': 'first',
+        'final_match_rate': 'first'
+    }).reset_index()
+    
+    summary_df = summary_df.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
+    summary_df = summary_df.sort_values('final_match_rate_percentage', ascending=False).head(100)
+    
     # Key insights
     st.markdown("### 🔍 Key Insights")
-
+    
     col1, col2, col3, col4 = st.columns(4)
-
+    
     with col1:
         avg_match = summary_df['final_match_rate_percentage'].mean()
         st.metric("Avg Match Rate", f"{avg_match:.1f}%")
-
+    
     with col2:
         top_match = summary_df['final_match_rate_percentage'].max()
         st.metric("Top Match", f"{top_match:.1f}%")
-
+    
     with col3:
         candidates_above_70 = (summary_df['final_match_rate_percentage'] >= 70).sum()
         st.metric("Matches ≥70%", candidates_above_70)
-
+    
     with col4:
         candidates_above_80 = (summary_df['final_match_rate_percentage'] >= 80).sum()
         st.metric("Matches ≥80%", candidates_above_80)
-
+    
     st.markdown("---")
-
+    
     # Visualizations
     col1, col2 = st.columns(2)
-
+    
     with col1:
         st.markdown("#### 📊 Match Score Distribution")
         fig_dist = plot_match_distribution(summary_df)
         st.plotly_chart(fig_dist, use_container_width=True)
-
+    
     with col2:
         st.markdown("#### 🏆 Top 10 Candidates")
         fig_top = plot_top_candidates(summary_df, top_n=10)
         st.plotly_chart(fig_top, use_container_width=True)
-
+    
     st.markdown("---")
-
+    
     # TGV Analysis
     st.markdown("### 📊 TGV-Level Analysis")
-
+    
     # Select employee for radar chart
     employee_options = summary_df.head(20)['employee_id'].tolist()
+    
+    if not employee_options:
+        st.warning("No employees found in results.")
+        return
+    
     selected_employee = st.selectbox(
         "Select Employee for TGV Profile:",
         options=employee_options,
         format_func=lambda x: f"{x} - {summary_df[summary_df['employee_id']==x]['fullname'].iloc[0]} ({summary_df[summary_df['employee_id']==x]['final_match_rate_percentage'].iloc[0]:.1f}%)"
     )
-
+    
     col1, col2 = st.columns(2)
-
+    
     with col1:
         st.markdown("#### 🎯 TGV Radar Profile")
         fig_radar = plot_tgv_radar(results_df, selected_employee)
         st.plotly_chart(fig_radar, use_container_width=True)
-
+    
     with col2:
         st.markdown("#### 🔥 TV Heatmap (Top TGVs)")
         fig_heatmap = plot_tv_heatmap(results_df, selected_employee)
         st.plotly_chart(fig_heatmap, use_container_width=True)
-
+    
     st.markdown("---")
-
+    
     # Strengths & Gaps
     st.markdown("### ✅ Strengths & Gaps Analysis")
-
+    
     fig_strengths_gaps = plot_strengths_gaps(results_df, selected_employee)
     st.plotly_chart(fig_strengths_gaps, use_container_width=True)
 
