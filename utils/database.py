@@ -163,14 +163,15 @@ class DatabaseManager:
     # ---------------------------------------------
     # RUN MATCHING PIPELINE
     # ---------------------------------------------
-    def run_matching_query(self, job_vacancy_id: int) -> pd.DataFrame:
-    """
-    Run COMPLETE matching pipeline: create all temp tables, then return detailed results.
-    This executes the FULL SQL workflow from your Step 2.
-    """
-    
-    with self.get_connection() as conn:
-        cur = conn.cursor()
+        def run_matching_query(self, job_vacancy_id: int) -> pd.DataFrame:
+        """
+        Run COMPLETE matching pipeline: create all temp tables, then return detailed results.
+        This executes the FULL SQL workflow from your Step 2.
+        """
+        
+        with self.get_connection() as conn:
+            cur = conn.cursor()
+
         
         try:
             # ===== 1) DROP OLD TABLES =====
