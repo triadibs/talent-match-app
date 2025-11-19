@@ -360,180 +360,6 @@ def show_create_vacancy_page():
                     st.exception(e)
 
 
-def show_results_page():
-    """Page showing matching results"""
-
-    st.markdown("## 📊 Talent Matching Results")
-
-    # Check if vacancy exists
-    if not st.session_state.vacancy_created:
-        st.warning("⚠️ No vacancy created yet. Please go to 'Create Vacancy' first.")
-
-        # Allow selecting existing vacancy
-        st.markdown("### Or select an existing vacancy:")
-        existing_vacancies = db.get_recent_vacancies(limit=20)
-
-        if not existing_vacancies.empty:
-            selected_vacancy = st.selectbox(
-                "Select Vacancy:",
-                options=existing_vacancies['job_vacancy_id'].tolist(),
-                format_func=lambda x: f"ID {x}: {existing_vacancies[existing_vacancies['job_vacancy_id']==x]['role_name'].iloc[0]}"
-            )
-
-            if st.button("Load Results"):
-                with st.spinner("Loading results..."):
-                    st.session_state.job_vacancy_id = selected_vacancy
-                    st.session_state.matching_results = db.run_matching_query(selected_vacancy)
-                    st.session_state.vacancy_created = True
-                    st.rerun()
-
-        return
-
-    # Get results
-    results_df = st.session_state.matching_results
-    vacancy_id = st.session_state.job_vacancy_id
-
-    if results_df is None or results_df.empty:
-        st.error("No matching results available.")
-        return
-
-    # Vacancy info
-    vacancy_info = db.get_vacancy_info(vacancy_id)
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Role", vacancy_info['role_name'])
-    with col2:
-        st.metric("Level", vacancy_info['job_level'])
-    with col3:
-        st.metric("Benchmarks", len(vacancy_info['selected_talent_ids']))
-
-    st.markdown("---")
-
-    # Tabs
-    tab1, tab2, tab3 = st.tabs(["🏆 Top Candidates", "📋 All Results", "📑 Job Profile"])
-
-    with tab1:
-        st.markdown("### 🏆 Top 20 Candidates")
-
-        # Get summary (top candidates)
-        summary_df = db.get_summary_results(vacancy_id, limit=20)
-
-        # Display with custom formatting
-        st.dataframe(
-            summary_df,
-            column_config={
-                "employee_id": "ID",
-                "fullname": "Name",
-                "directorate": "Directorate",
-                "role": "Current Role",
-                "grade": "Grade",
-                "final_match_rate_percentage": st.column_config.ProgressColumn(
-                    "Match Score",
-                    format="%.2f%%",
-                    min_value=0,
-                    max_value=100
-                ),
-                "tgv_count_with_baseline": "TGVs Matched"
-            },
-            hide_index=True,
-            use_container_width=True,
-            height=600
-        )
-
-        # Download button
-        csv = summary_df.to_csv(index=False)
-        st.download_button(
-            label="📥 Download Top Candidates (CSV)",
-            data=csv,
-            file_name=f"top_candidates_vacancy_{vacancy_id}.csv",
-            mime="text/csv"
-        )
-
-    with tab2:
-        st.markdown("### 📋 Detailed Matching Results")
-        st.caption("Shows TV-level match rates for all employees")
-
-        # Filters
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-            min_match = st.slider("Minimum Match Rate (%)", 0, 100, 50)
-
-        with col2:
-            selected_tgv = st.multiselect(
-                "Filter by TGV:",
-                options=results_df['tgv_name'].unique().tolist(),
-                default=results_df['tgv_name'].unique().tolist()
-            )
-
-        with col3:
-            top_n = st.number_input("Show top N employees:", min_value=10, max_value=500, value=50)
-
-        # Filter
-        filtered_df = results_df[
-            (results_df['final_match_rate'] >= min_match) &
-            (results_df['tgv_name'].isin(selected_tgv))
-        ]
-
-        # Get top N employees by final match rate
-        top_employees = filtered_df.nlargest(top_n, 'final_match_rate')['employee_id'].unique()
-        display_df = filtered_df[filtered_df['employee_id'].isin(top_employees)]
-
-        st.dataframe(
-            display_df,
-            column_config={
-                "employee_id": "Employee ID",
-                "fullname": "Name",
-                "tgv_name": "TGV",
-                "tv_name": "TV",
-                "baseline_score": st.column_config.NumberColumn("Baseline", format="%.2f"),
-                "user_score": st.column_config.NumberColumn("User Score", format="%.2f"),
-                "tv_match_rate": st.column_config.ProgressColumn("TV Match %", format="%.2f%%", min_value=0, max_value=100),
-                "tgv_match_rate": st.column_config.NumberColumn("TGV Match %", format="%.2f%%"),
-                "final_match_rate": st.column_config.ProgressColumn("Final Match %", format="%.2f%%", min_value=0, max_value=100)
-            },
-            hide_index=True,
-            use_container_width=True,
-            height=600
-        )
-
-        # Download detailed results
-        csv_detailed = display_df.to_csv(index=False)
-        st.download_button(
-            label="📥 Download Detailed Results (CSV)",
-            data=csv_detailed,
-            file_name=f"detailed_results_vacancy_{vacancy_id}.csv",
-            mime="text/csv"
-        )
-
-    with tab3:
-        st.markdown("### 📑 AI-Generated Job Profile")
-
-        if 'job_profile' in st.session_state:
-            profile = st.session_state.job_profile
-
-            col1, col2 = st.columns([2, 1])
-
-            with col1:
-                st.markdown("#### 📋 Job Requirements")
-                st.write(profile.get('requirements', 'N/A'))
-
-                st.markdown("#### 📝 Job Description")
-                st.write(profile.get('description', 'N/A'))
-
-            with col2:
-                st.markdown("#### 🎯 Key Competencies")
-                competencies = profile.get('competencies', [])
-                if isinstance(competencies, list):
-                    for comp in competencies:
-                        st.markdown(f"• {comp}")
-                else:
-                    st.write(competencies)
-        else:
-            st.info("Job profile not available for this vacancy.")
-
-
 def show_analytics_page():
     """Page with visualizations and analytics"""
     
@@ -557,7 +383,20 @@ def show_analytics_page():
     }).reset_index()
     
     summary_df = summary_df.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
+    
+    # 🔥 CRITICAL FIX: Convert to numeric and drop NaN
+    summary_df['final_match_rate_percentage'] = pd.to_numeric(
+        summary_df['final_match_rate_percentage'], 
+        errors='coerce'
+    )
+    summary_df = summary_df.dropna(subset=['final_match_rate_percentage'])
+    
     summary_df = summary_df.sort_values('final_match_rate_percentage', ascending=False).head(100)
+    
+    # Check if we have data
+    if summary_df.empty:
+        st.warning("⚠️ No valid matching results found.")
+        return
     
     # Key insights
     st.markdown("### 🔍 Key Insights")
@@ -587,13 +426,19 @@ def show_analytics_page():
     
     with col1:
         st.markdown("#### 📊 Match Score Distribution")
-        fig_dist = plot_match_distribution(summary_df)
-        st.plotly_chart(fig_dist, use_container_width=True)
+        try:
+            fig_dist = plot_match_distribution(summary_df)
+            st.plotly_chart(fig_dist, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error creating distribution chart: {e}")
     
     with col2:
         st.markdown("#### 🏆 Top 10 Candidates")
-        fig_top = plot_top_candidates(summary_df, top_n=10)
-        st.plotly_chart(fig_top, use_container_width=True)
+        try:
+            fig_top = plot_top_candidates(summary_df, top_n=10)
+            st.plotly_chart(fig_top, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error creating top candidates chart: {e}")
     
     st.markdown("---")
     
@@ -617,18 +462,30 @@ def show_analytics_page():
     
     with col1:
         st.markdown("#### 🎯 TGV Radar Profile")
-        fig_radar = plot_tgv_radar(results_df, selected_employee)
-        st.plotly_chart(fig_radar, use_container_width=True)
+        try:
+            fig_radar = plot_tgv_radar(results_df, selected_employee)
+            st.plotly_chart(fig_radar, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error creating radar chart: {e}")
     
     with col2:
         st.markdown("#### 🔥 TV Heatmap (Top TGVs)")
-        fig_heatmap = plot_tv_heatmap(results_df, selected_employee)
-        st.plotly_chart(fig_heatmap, use_container_width=True)
+        try:
+            fig_heatmap = plot_tv_heatmap(results_df, selected_employee)
+            st.plotly_chart(fig_heatmap, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error creating heatmap: {e}")
     
     st.markdown("---")
     
     # Strengths & Gaps
     st.markdown("### ✅ Strengths & Gaps Analysis")
     
-    fig_strengths_gaps = plot_strengths_gaps(results_df, selected_employee)
-    st.plotly_chart(fig_strengths_gaps, use_container_width=True)
+    try:
+        fig_strengths_gaps = plot_strengths_gaps(results_df, selected_employee)
+        st.plotly_chart(fig_strengths_gaps, use_container_width=True)
+    except Exception as e:
+        st.error(f"Error creating strengths/gaps chart: {e}")
+
+if __name__ == "__main__":
+    main()
