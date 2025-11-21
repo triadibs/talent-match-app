@@ -164,16 +164,13 @@ class DatabaseManager:
     # RUN MATCHING PIPELINE
     # ---------------------------------------------
     def run_matching_query(self, job_vacancy_id: int) -> pd.DataFrame:
-        """
-        Run COMPLETE matching pipeline: create all temp tables, then return detailed results.
-        This executes the FULL SQL workflow from your Step 2.
-        """
-        
-        with self.get_connection() as conn:
-            cur = conn.cursor()
-
-        
-            try:
+    """
+    Run COMPLETE matching pipeline: create all temp tables, then return detailed results.
+    This executes the FULL SQL workflow from your Step 2.
+    """
+    with self.get_connection() as conn:
+        try:
+            with conn.cursor() as cur:
                 # ===== 1) DROP OLD TABLES =====
                 cur.execute("""
                 DROP TABLE IF EXISTS tb_vacancy CASCADE;
@@ -189,6 +186,7 @@ class DatabaseManager:
                 DROP TABLE IF EXISTS tb_tgv_with_weights CASCADE;
                 DROP TABLE IF EXISTS tb_final_aggregation CASCADE;
                 """)
+
                 
                 # ===== 2) CREATE VACANCY TABLE =====
                 cur.execute(f"""
@@ -485,7 +483,7 @@ class DatabaseManager:
                 """)
                 
                 # ===== 13) FINAL AGGREGATION =====
-                cur.execute("""
+                                cur.execute("""
                 CREATE TABLE tb_final_aggregation AS
                 SELECT
                   employee_id,
@@ -530,14 +528,19 @@ class DatabaseManager:
                 ORDER BY fa.final_match_rate DESC NULLS LAST, 
                          tm.employee_id, tm.tgv_name, tm.tv_name
                 """
-            
-            df = pd.read_sql_query(final_sql, conn)
-            return df
-            
+
+                # baca hasil menggunakan pandas (di dalam try)
+                df = pd.read_sql_query(final_sql, conn)
+                return df
+
         except Exception as e:
-            conn.rollback()
+            # pastikan rollback tersedia (karena kita masih berada dalam `with self.get_connection() as conn`)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             st.error(f"❌ SQL Pipeline Error: {str(e)}")
-            raise e
+            raise
 
     # ---------------------------------------------
     # SUMMARY RESULTS
