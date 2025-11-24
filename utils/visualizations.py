@@ -1,106 +1,114 @@
 # utils/visualizations.py
 # -*- coding: utf-8 -*-
 """
-Robust visualization helpers for Talent Match Intelligence System.
+Robust Visualization utilities for Talent Match Dashboard (Plotly)
 
-This version:
-- coerces columns to numeric safely
-- avoids deprecated DataFrame.append (uses pd.concat)
-- provides clear ValueError messages for missing/invalid data
-- tolerates string-numeric inputs (e.g. '99.5') and converts to float
+This version is defensive: coerces numeric-like strings to floats, supports percent strings,
+handles 0..1 vs 0..100 scaling, and avoids deprecated pandas APIs.
 """
 
+import plotly.graph_objects as go
+import plotly.express as px
 import pandas as pd
 import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
 from typing import List, Optional
 
-def _coerce_series_to_numeric(s: pd.Series) -> pd.Series:
-    """Safely coerce a Series to numeric; return Series (float dtype) with NaN on failure."""
-    if s is None:
-        return s
-    # first try direct to_numeric (handles strings with numeric content)
-    try:
-        out = pd.to_numeric(s, errors='coerce')
-    except Exception:
-        # fallback: convert to str then attempt
-        out = pd.to_numeric(s.astype(str).str.replace(r'[^\d\.\-eE]', '', regex=True), errors='coerce')
-    return out
+
+def _to_numeric_percent(series: pd.Series) -> pd.Series:
+    """
+    Convert a Series that may contain numeric-like strings or percent-strings into floats on 0..100 scale.
+    Rules:
+      - strip whitespace
+      - remove trailing '%' if present
+      - replace comma decimal separators if needed
+      - coerce to numeric, errors -> NaN
+      - if numeric max <= 1.0 -> assume 0..1 scale and multiply by 100
+    Returns new Series (float, may contain NaN).
+    """
+    if series is None:
+        return pd.Series(dtype=float)
+
+    s = series.astype(str).str.strip().replace({'': np.nan, 'nan': np.nan, 'None': np.nan})
+    # remove percent sign and thousand separators
+    s = s.str.replace('%', '', regex=False)
+    s = s.str.replace(',', '.', regex=False)  # if comma used as decimal
+
+    # Try to coerce to numeric
+    coerced = pd.to_numeric(s, errors='coerce')
+
+    # If all NaN, return as-is
+    if coerced.dropna().empty:
+        return coerced.astype(float)
+
+    maxv = coerced.max(skipna=True)
+    if pd.notna(maxv) and maxv <= 1.0:
+        coerced = coerced * 100.0
+
+    return coerced.astype(float)
+
 
 def _ensure_percent_scale(s: pd.Series) -> pd.Series:
-    """
-    Ensure series is on 0-100 percent scale.
-    If values appear to be in 0-1 range (max <= 1.0), multiply by 100.
-    Non-numeric values become NaN.
-    """
-    if s is None:
-        return s
-    s_num = _coerce_series_to_numeric(s)
-    if s_num is None or s_num.empty:
-        return s_num
-    maxv = s_num.max(skipna=True)
-    if pd.isna(maxv):
-        return s_num
-    if maxv <= 1.0:
-        return s_num * 100.0
-    return s_num
+    """Compatibility wrapper kept for naming parity."""
+    return _to_numeric_percent(s)
 
-def _ensure_columns(df: pd.DataFrame, required: List[str]):
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"results_df must contain columns: {set(required)} (missing: {missing})")
 
-# -------------------------
-# Plot helpers
-# -------------------------
 def plot_match_distribution(summary_df: pd.DataFrame) -> go.Figure:
+    """Histogram of final_match_rate_percentage (expects percent 0..100)."""
     if summary_df is None or summary_df.empty:
-        raise ValueError("summary_df is empty")
+        raise ValueError("summary_df is empty or None")
 
     if 'final_match_rate_percentage' not in summary_df.columns:
         raise ValueError("summary_df must contain column 'final_match_rate_percentage'")
 
-    x_series = _ensure_percent_scale(summary_df['final_match_rate_percentage'])
-    x_series = x_series.dropna()
+    x_series = _ensure_percent_scale(summary_df['final_match_rate_percentage']).dropna()
     if x_series.empty:
         raise ValueError("No numeric final_match_rate_percentage values to plot")
 
-    # Clip 0..100
-    x_series = x_series.clip(0, 100)
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=x_series,
+        nbinsx=20,
+        name='Count',
+        opacity=0.7,
+        hovertemplate='Match Rate: %{x:.1f}%<br>Count: %{y}<extra></extra>'
+    ))
 
-    fig = px.histogram(x=x_series, nbins=20, title="Match Score Distribution")
     mean_val = float(x_series.mean())
     fig.add_vline(x=mean_val, line_dash="dash", line_color="red",
                   annotation_text=f"Mean: {mean_val:.1f}%", annotation_position="top")
-    fig.update_layout(xaxis_title="Match Rate (%)", yaxis_title="Number of Candidates", showlegend=False, height=400)
+    fig.add_vline(x=70, line_dash="dot", line_color="green", opacity=0.5)
+    fig.add_vline(x=80, line_dash="dot", line_color="darkgreen", opacity=0.5)
+
+    fig.update_layout(title="Match Score Distribution",
+                      xaxis_title="Match Rate (%)",
+                      yaxis_title="Number of Candidates",
+                      showlegend=False, height=400, template="plotly_white")
     return fig
 
+
 def plot_top_candidates(summary_df: pd.DataFrame, top_n: int = 10) -> go.Figure:
+    """Horizontal bar chart for top candidates."""
     for col in ['final_match_rate_percentage', 'fullname', 'employee_id']:
         if col not in summary_df.columns:
             raise ValueError(f"summary_df must contain column '{col}'")
 
     df = summary_df.copy()
     df['final_match_rate_percentage'] = _ensure_percent_scale(df['final_match_rate_percentage'])
-    df = df.dropna(subset=['final_match_rate_percentage'])
-    if df.empty:
+    if df['final_match_rate_percentage'].dropna().empty:
         raise ValueError("No numeric final_match_rate_percentage values for top candidates")
 
     top_df = df.nlargest(top_n, 'final_match_rate_percentage').copy()
     top_df = top_df.sort_values('final_match_rate_percentage', ascending=True)
 
-    # build label defensively
     def _label(row):
         name = row.get('fullname', '')
         role = row.get('role', None)
         pct = row.get('final_match_rate_percentage', np.nan)
         try:
-            pctf = float(pct)
-            pct_str = f"{pctf:.1f}%"
+            pct_str = f"{float(pct):.1f}%"
         except Exception:
-            pct_str = ""
-        if pd.notna(role) and role:
+            pct_str = "N/A"
+        if pd.notna(role):
             return f"{name} — {role} ({pct_str})"
         return f"{name} ({pct_str})"
 
@@ -111,30 +119,47 @@ def plot_top_candidates(summary_df: pd.DataFrame, top_n: int = 10) -> go.Figure:
         x=top_df['final_match_rate_percentage'],
         y=top_df['label'],
         orientation='h',
-        text=top_df['final_match_rate_percentage'].apply(lambda x: f"{float(x):.1f}%" if pd.notna(x) else ""),
+        text=top_df['final_match_rate_percentage'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "N/A"),
         textposition='outside',
+        marker=dict(color=top_df['final_match_rate_percentage'], colorscale='Blues'),
         hovertemplate="<b>%{y}</b><br>Match: %{x:.1f}%<extra></extra>"
     ))
-    fig.update_layout(title=f"Top {len(top_df)} Candidates", xaxis_title="Match Rate (%)",
-                      yaxis_title="Candidate", height=400 + 30 * min(len(top_df), top_n),
+
+    fig.update_layout(title=f"Top {len(top_df)} Candidates",
+                      xaxis_title="Match Rate (%)",
+                      yaxis_title="Candidate",
+                      height=400 + 30 * min(len(top_df), top_n),
+                      template="plotly_white",
                       margin=dict(l=220 if len(top_df) > 6 else 120, r=40, t=60, b=40))
     return fig
 
-def plot_tgv_radar(results_df: pd.DataFrame, employee_id: str) -> go.Figure:
-    _ensure_columns(results_df, ['employee_id', 'tgv_name', 'tgv_match_rate'])
-    emp = results_df[results_df['employee_id'] == employee_id].copy()
-    if emp.empty:
-        raise ValueError(f"No TGV rows for employee_id {employee_id}")
 
-    emp['tgv_match_rate'] = _ensure_percent_scale(emp['tgv_match_rate'])
-    emp = emp.dropna(subset=['tgv_match_rate'])
-    if emp.empty:
+def plot_tgv_radar(results_df: pd.DataFrame, employee_id: str) -> go.Figure:
+    """Radar chart for TGV-level match rates for a single employee."""
+    if results_df is None or results_df.empty:
+        raise ValueError("results_df is empty or None")
+
+    required = {'employee_id', 'tgv_name', 'tgv_match_rate'}
+    if not required.issubset(results_df.columns):
+        raise ValueError("results_df must contain 'employee_id', 'tgv_name', and 'tgv_match_rate' columns")
+
+    emp_df = results_df[results_df['employee_id'] == employee_id].copy()
+    if emp_df.empty:
+        raise ValueError(f"No rows for employee_id={employee_id} in results_df")
+
+    # coerce tgv_match_rate to numeric percent
+    emp_df['tgv_match_rate'] = _ensure_percent_scale(emp_df['tgv_match_rate'])
+    tgv_df = emp_df.groupby('tgv_name', as_index=False)['tgv_match_rate'].max()
+
+    tgv_df = tgv_df.dropna(subset=['tgv_match_rate'])
+    if tgv_df.empty:
         raise ValueError("No numeric tgv_match_rate values found for this employee")
 
-    agg = emp.groupby('tgv_name', as_index=False)['tgv_match_rate'].mean().sort_values('tgv_match_rate', ascending=False)
-    categories = agg['tgv_name'].tolist()
-    values = agg['tgv_match_rate'].astype(float).tolist()
+    tgv_df = tgv_df.sort_values('tgv_match_rate', ascending=False)
+    categories = tgv_df['tgv_name'].tolist()
+    values = tgv_df['tgv_match_rate'].tolist()
 
+    # close loop for radar
     if len(categories) == 1:
         categories = categories * 2
         values = values * 2
@@ -142,82 +167,145 @@ def plot_tgv_radar(results_df: pd.DataFrame, employee_id: str) -> go.Figure:
         categories = categories + [categories[0]]
         values = values + [values[0]]
 
-    fig = go.Figure(data=go.Scatterpolar(r=values, theta=categories, fill='toself', name=str(employee_id)))
-    fig.update_layout(polar=dict(radialaxis=dict(range=[0, 100], visible=True)), showlegend=False,
-                      title=f"TGV Radar Profile — Employee {employee_id}", height=480)
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=values,
+        theta=categories,
+        fill='toself',
+        name=str(employee_id),
+        hovertemplate="%{theta}: %{r:.1f}%<extra></extra>"
+    ))
+
+    fig.update_layout(
+        polar=dict(radialaxis=dict(visible=True, range=[0, max(100, max(values) if values else 100)])),
+        showlegend=False,
+        title=f"TGV Radar Profile — Employee {employee_id}",
+        template="plotly_white",
+        height=480
+    )
     return fig
 
+
 def plot_tv_heatmap(results_df: pd.DataFrame, employee_id: str, top_tgv_count: int = 4) -> go.Figure:
+    """Heatmap of TV vs TGV showing tv_match_rate for an employee."""
+
     required = {'employee_id', 'tgv_name', 'tv_name', 'tv_match_rate'}
-    if not required.issubset(set(results_df.columns)):
+    if not required.issubset(results_df.columns):
         raise ValueError(f"results_df must contain columns: {required}")
 
-    emp = results_df[results_df['employee_id'] == employee_id].copy()
-    if emp.empty:
-        raise ValueError(f"No rows for employee_id={employee_id}")
+    emp_df = results_df[results_df['employee_id'] == employee_id].copy()
+    if emp_df.empty:
+        raise ValueError(f"No rows for employee_id={employee_id} in results_df")
 
-    emp['tv_match_rate'] = _ensure_percent_scale(emp['tv_match_rate'])
-    emp = emp.dropna(subset=['tv_match_rate'])
-    if emp.empty:
+    emp_df['tv_match_rate'] = _ensure_percent_scale(emp_df['tv_match_rate'])
+    emp_df = emp_df.dropna(subset=['tv_match_rate'])
+    if emp_df.empty:
         raise ValueError("No numeric tv_match_rate values for this employee")
 
-    if 'tgv_match_rate' in emp.columns:
-        tgv_rank = emp.groupby('tgv_name', as_index=False)['tgv_match_rate'].max().sort_values('tgv_match_rate', ascending=False)
+    # rank tgv by tgv_match_rate if present else by mean tv_match_rate
+    if 'tgv_match_rate' in emp_df.columns:
+        emp_df['tgv_match_rate'] = _ensure_percent_scale(emp_df['tgv_match_rate'])
+        tgv_rank = emp_df.groupby('tgv_name', as_index=False)['tgv_match_rate'].max().sort_values('tgv_match_rate', ascending=False)
     else:
-        tgv_rank = emp.groupby('tgv_name', as_index=False)['tv_match_rate'].mean().sort_values('tv_match_rate', ascending=False)
+        tgv_rank = emp_df.groupby('tgv_name', as_index=False)['tv_match_rate'].mean().sort_values('tv_match_rate', ascending=False)
 
     top_tgvs = tgv_rank['tgv_name'].head(top_tgv_count).tolist()
-    df_plot = emp[emp['tgv_name'].isin(top_tgvs)].copy()
+    df_plot = emp_df[emp_df['tgv_name'].isin(top_tgvs)].copy()
     if df_plot.empty:
         raise ValueError("No TV rows after filtering for top TGVs.")
 
-    pivot = df_plot.pivot_table(index='tv_name', columns='tgv_name', values='tv_match_rate', aggfunc='max')
-    pivot = pivot.replace({np.nan: None})
-    if pivot.size == 0:
-        raise ValueError("Pivot table is empty")
+    pivot = df_plot.pivot_table(index='tv_name', columns='tgv_name', values='tv_match_rate', aggfunc='max').fillna(np.nan)
+    if pivot.empty:
+        raise ValueError("Pivot resulted in empty heatmap matrix.")
 
-    z = pivot.values.astype(float)
+    pivot['max_val'] = pivot.max(axis=1)
+    pivot = pivot.sort_values('max_val', ascending=False).drop(columns='max_val')
+
+    z = pivot.values
     x = pivot.columns.tolist()
     y = pivot.index.tolist()
-    text = [[(f"{v:.1f}%" if v is not None and not np.isnan(v) else "") for v in row] for row in z]
 
-    fig = go.Figure(data=go.Heatmap(z=z, x=x, y=y, text=text, texttemplate="%{text}", hovertemplate="TV: %{y}<br>TGV: %{x}<br>Match: %{z:.1f}%<extra></extra>"))
-    fig.update_layout(title=f"TV Match Heatmap — Employee {employee_id} (Top TGVs)", xaxis_title="TGV", yaxis_title="TV", height=500)
+    # build text annotations robustly
+    text = []
+    for row in z:
+        text_row = []
+        for val in row:
+            if pd.isna(val):
+                text_row.append("")
+            else:
+                try:
+                    text_row.append(f"{float(val):.1f}%")
+                except Exception:
+                    text_row.append("")
+        text.append(text_row)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=z,
+        x=x,
+        y=y,
+        text=text,
+        texttemplate="%{text}",
+        hovertemplate="TV: %{y}<br>TGV: %{x}<br>Match: %{z:.1f}%<extra></extra>",
+        colorscale='Viridis',
+        colorbar=dict(title="Match %")
+    ))
+
+    fig.update_layout(title=f"TV Match Heatmap — Employee {employee_id} (Top TGVs)",
+                      xaxis_title="TGV", yaxis_title="TV", height=500, template="plotly_white")
     return fig
 
+
 def plot_strengths_gaps(results_df: pd.DataFrame, employee_id: str, top_k: int = 10) -> go.Figure:
-    if 'tv_name' not in results_df.columns or 'tv_match_rate' not in results_df.columns:
+    """Bar chart showing strengths and gaps at TV level for the selected employee."""
+
+    if results_df is None or results_df.empty:
+        raise ValueError("results_df is empty or None")
+
+    if 'employee_id' not in results_df.columns or 'tv_name' not in results_df.columns or 'tv_match_rate' not in results_df.columns:
         raise ValueError("results_df must contain at least 'tv_name' and 'tv_match_rate'")
 
-    emp = results_df[results_df['employee_id'] == employee_id].copy()
-    if emp.empty:
-        raise ValueError(f"No rows for employee_id={employee_id}")
+    emp_df = results_df[results_df['employee_id'] == employee_id].copy()
+    if emp_df.empty:
+        raise ValueError(f"No rows for employee_id={employee_id} in results_df")
 
-    emp['tv_match_rate'] = _ensure_percent_scale(emp['tv_match_rate'])
-    # ensure baseline/user numeric if present
-    if 'baseline_score' in emp.columns:
-        emp['baseline_score'] = _coerce_series_to_numeric(emp['baseline_score'])
-    if 'user_score' in emp.columns:
-        emp['user_score'] = _coerce_series_to_numeric(emp['user_score'])
+    emp_df['tv_match_rate'] = _ensure_percent_scale(emp_df['tv_match_rate'])
+    emp_df = emp_df.dropna(subset=['tv_match_rate'])
+    if emp_df.empty:
+        raise ValueError("No numeric tv_match_rate values for this employee")
 
-    agg = emp.groupby(['tgv_name', 'tv_name'], as_index=False).agg({
+    # Aggregate safely
+    agg = emp_df.groupby(['tgv_name', 'tv_name'], as_index=False).agg({
         'tv_match_rate': 'max',
-        'baseline_score': 'max' if 'baseline_score' in emp.columns else (lambda x: np.nan),
-        'user_score': 'max' if 'user_score' in emp.columns else (lambda x: np.nan)
+        'baseline_score': (lambda x: np.nan) if 'baseline_score' not in emp_df.columns else ('baseline_score', 'max'),
+        'user_score': (lambda x: np.nan) if 'user_score' not in emp_df.columns else ('user_score', 'max')
     })
 
-    agg_sorted = agg.sort_values('tv_match_rate', ascending=False)
-    top_part = agg_sorted.head(top_k)
-    bottom_part = agg_sorted.tail(top_k)
-    display_df = pd.concat([top_part, bottom_part]).drop_duplicates().reset_index(drop=True)
-    display_df = display_df.sort_values('tv_match_rate', ascending=True)
+    # If custom aggregation keys above produced MultiIndex, normalize columns
+    if isinstance(agg.columns, pd.MultiIndex):
+        agg.columns = ['_'.join([str(c) for c in col]).strip('_') for col in agg.columns]
+
+    # ensure we have the expected column names
+    if 'tv_match_rate' not in agg.columns:
+        # try to find the numeric column produced
+        num_cols = [c for c in agg.columns if 'tv_match_rate' in c]
+        if num_cols:
+            agg = agg.rename(columns={num_cols[0]: 'tv_match_rate'})
+        else:
+            raise ValueError("Aggregation failed to produce 'tv_match_rate' column")
+
+    agg_sorted = agg.sort_values('tv_match_rate', ascending=False).reset_index(drop=True)
+
+    # Build display df: top_k strengths + top_k gaps (don't duplicate)
+    top_strengths = agg_sorted.head(top_k)
+    top_gaps = agg_sorted.tail(top_k)
+    display_df = pd.concat([top_strengths, top_gaps], ignore_index=True).drop_duplicates().reset_index(drop=True)
 
     if display_df.empty:
-        raise ValueError("No TV rows with numeric tv_match_rate to show")
+        raise ValueError("No TV rows with numeric tv_match_rate to display")
+
+    display_df = display_df.sort_values('tv_match_rate', ascending=True)
 
     def _color(v):
-        if pd.isna(v):
-            return '#d3d3d3'
         try:
             v = float(v)
         except Exception:
@@ -230,29 +318,47 @@ def plot_strengths_gaps(results_df: pd.DataFrame, employee_id: str, top_k: int =
 
     colors = [_color(v) for v in display_df['tv_match_rate']]
 
-    def _fmt(v):
+    def _hover(r):
+        base = f"TGV: {r.get('tgv_name','') if 'tgv_name' in r else ''}<br>TV: {r.get('tv_name','') if 'tv_name' in r else ''}"
         try:
-            return f"{float(v):.1f}%"
+            match = f"<br>Match: {float(r['tv_match_rate']):.1f}%"
         except Exception:
-            return ""
+            match = ""
+        user = ""
+        base_score = ""
+        if 'user_score' in r and pd.notna(r.get('user_score', np.nan)):
+            try:
+                user = f"<br>User Score: {float(r['user_score']):.2f}"
+            except Exception:
+                user = ""
+        if 'baseline_score' in r and pd.notna(r.get('baseline_score', np.nan)):
+            try:
+                base_score = f"<br>Baseline: {float(r['baseline_score']):.2f}"
+            except Exception:
+                base_score = ""
+        return base + match + user + base_score
 
-    hover_text = display_df.apply(
-        lambda r: f"TGV: {r.get('tgv_name','')}<br>TV: {r.get('tv_name','')}<br>Match: {_fmt(r.get('tv_match_rate', np.nan))}"
-                  + (f"<br>User Score: {r['user_score']:.2f}" if pd.notna(r.get('user_score', np.nan)) else "")
-                  + (f"<br>Baseline: {r['baseline_score']:.2f}" if pd.notna(r.get('baseline_score', np.nan)) else ""),
-        axis=1
-    )
+    hover_text = display_df.apply(_hover, axis=1)
+
+    y_labels = display_df.apply(lambda r: f"{r.get('tv_name','')} — {r.get('tgv_name','')}", axis=1)
 
     fig = go.Figure(go.Bar(
-        x=[float(x) if pd.notna(x) else 0 for x in display_df['tv_match_rate']],
-        y=display_df.apply(lambda r: f"{r.get('tv_name','')} — {r.get('tgv_name','')}", axis=1),
+        x=display_df['tv_match_rate'],
+        y=y_labels,
         orientation='h',
         marker=dict(color=colors),
         hovertext=hover_text,
         hoverinfo='text',
-        text=[_fmt(x) for x in display_df['tv_match_rate']],
+        text=display_df['tv_match_rate'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else ""),
         textposition='outside'
     ))
 
-    fig.update_layout(title=f"Strengths & Gaps — Employee {employee_id}", xaxis_title="TV Match Rate (%)", yaxis_title="TV — TGV", height=420 + 25 * len(display_df), margin=dict(l=240 if len(display_df) > 8 else 120, r=40, t=60, b=40))
+    fig.update_layout(
+        title=f"Strengths & Gaps — Employee {employee_id}",
+        xaxis_title="TV Match Rate (%)",
+        yaxis_title="TV — TGV",
+        height=420 + 25 * len(display_df),
+        template="plotly_white",
+        margin=dict(l=240 if len(display_df) > 8 else 120, r=40, t=60, b=40)
+    )
     return fig
