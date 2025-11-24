@@ -80,13 +80,19 @@ def generate_fallback_profile(role_name: str, job_level: str, role_purpose: str)
         ]
     }
 
-# Initialize session state
+# Initialize session state (expanded keys)
 if 'vacancy_created' not in st.session_state:
     st.session_state.vacancy_created = False
 if 'job_vacancy_id' not in st.session_state:
     st.session_state.job_vacancy_id = None
-if 'matching_results' not in st.session_state:
-    st.session_state.matching_results = None
+# matching_results_summary: one-row-per-employee (lightweight)
+if 'matching_results_summary' not in st.session_state:
+    st.session_state.matching_results_summary = None
+# matching_results_detailed: per-TV/per-TGV rows (for analytics)
+if 'matching_results_detailed' not in st.session_state:
+    st.session_state.matching_results_detailed = None
+if 'job_profile' not in st.session_state:
+    st.session_state.job_profile = None
 
 # Initialize database connection
 @st.cache_resource
@@ -280,10 +286,31 @@ def show_create_vacancy_page():
                     st.exception(e)
                     st.stop()
             
-            # 4. Save to session state
+            # 4. Save to session state (store both detailed + summary)
+            detailed = matching_results.copy()
+            # normalize final_match_rate column
+            if 'final_match_rate' in detailed.columns and 'final_match_rate_percentage' not in detailed.columns:
+                detailed = detailed.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
+            if 'final_match_rate_percentage' in detailed.columns:
+                detailed['final_match_rate_percentage'] = pd.to_numeric(detailed['final_match_rate_percentage'], errors='coerce')
+                # scale 0..1 -> 0..100 if needed
+                maxv = detailed['final_match_rate_percentage'].max(skipna=True)
+                if pd.notna(maxv) and maxv <= 1.0:
+                    detailed['final_match_rate_percentage'] = detailed['final_match_rate_percentage'] * 100.0
+
+            summary_df = detailed.groupby('employee_id').agg({
+                'fullname': 'first',
+                'directorate': 'first',
+                'role': 'first',
+                'grade': 'first',
+                'final_match_rate_percentage': 'first'
+            }).reset_index()
+            summary_df['final_match_rate_percentage'] = pd.to_numeric(summary_df['final_match_rate_percentage'], errors='coerce')
+
             st.session_state.vacancy_created = True
             st.session_state.job_vacancy_id = vacancy_id
-            st.session_state.matching_results = matching_results.copy() if isinstance(matching_results, pd.DataFrame) else matching_results
+            st.session_state.matching_results_detailed = detailed
+            st.session_state.matching_results_summary = summary_df
             st.session_state.job_profile = job_profile
             
             # 5. DISPLAY AI JOB PROFILE (THIS IS CRITICAL!)
@@ -341,8 +368,6 @@ def show_results_page():
                     # Try to get a DB-side compact summary first (recommended)
                     try:
                         summary_df = db.get_summary_results(vac_id, limit=5000)
-                        # Some implementations of get_summary_results return different column name,
-                        # coerce to consistent format below.
                     except Exception:
                         summary_df = pd.DataFrame()
 
@@ -372,7 +397,8 @@ def show_results_page():
                             if found:
                                 st.write(f"DEBUG: using column '{found}' as score.")
                         # If scores appear to be 0..1 scale, convert to %
-                        if tmp['final_match_rate_percentage'].max(skipna=True) <= 1.0:
+                        max_val = tmp['final_match_rate_percentage'].max(skipna=True) if 'final_match_rate_percentage' in tmp.columns else None
+                        if pd.notna(max_val) and max_val <= 1.0:
                             tmp['final_match_rate_percentage'] = tmp['final_match_rate_percentage'] * 100.0
                         # Now aggregate one row per employee
                         summary_df = tmp.groupby('employee_id').agg({
@@ -382,6 +408,8 @@ def show_results_page():
                             'grade': 'first',
                             'final_match_rate_percentage': 'first'
                         }).reset_index()
+                        # Store detailed as well for analytics
+                        st.session_state.matching_results_detailed = tmp
 
                     # Final checks: ensure we have numeric scores
                     if 'final_match_rate_percentage' not in summary_df.columns:
@@ -413,7 +441,6 @@ def show_results_page():
                         try:
                             raw = db.execute_query("SELECT employee_id, fullname, directorate, role, grade, final_match_rate FROM tb_final_aggregation ORDER BY final_match_rate DESC LIMIT 200", params=None, fetch=True)
                             if isinstance(raw, pd.DataFrame) and not raw.empty:
-                                # rename for display consistency
                                 raw = raw.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
                                 raw['final_match_rate_percentage'] = pd.to_numeric(raw['final_match_rate_percentage'], errors='coerce')
                                 st.dataframe(raw.head(200), use_container_width=True)
@@ -425,7 +452,7 @@ def show_results_page():
 
                     # store summary in session_state (lightweight)
                     st.session_state.job_vacancy_id = vac_id
-                    st.session_state.matching_results = summary_df.copy()
+                    st.session_state.matching_results_summary = summary_df.copy()
                     st.session_state.vacancy_created = True
                     st.success(f"Loaded vacancy {vac_id} — {len(summary_df)} summary rows.")
                     return
@@ -434,19 +461,19 @@ def show_results_page():
                     st.exception(e)
         return
 
-    # At this point, session contains matching_results (summary_df)
-    results_df = st.session_state.matching_results
+    # At this point, session contains matching_results_summary
+    summary_df = st.session_state.matching_results_summary
     vacancy_id = st.session_state.job_vacancy_id
 
-    if results_df is None:
-        st.error("matching_results is None in session_state.")
+    if summary_df is None:
+        st.error("matching_results_summary is None in session_state.")
         return
-    if isinstance(results_df, pd.DataFrame) and results_df.empty:
-        st.error("matching_results DataFrame is empty.")
+    if isinstance(summary_df, pd.DataFrame) and summary_df.empty:
+        st.error("matching_results_summary DataFrame is empty.")
         return
 
     # Normalize column name to final_match_rate_percentage
-    df = results_df.copy()
+    df = summary_df.copy()
     if 'final_match_rate' in df.columns and 'final_match_rate_percentage' not in df.columns:
         df = df.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
     # ensure numeric
@@ -503,70 +530,96 @@ def show_results_page():
         "text/csv"
     )
 
+    # Small control to refresh detailed results if user wants to re-run pipeline
+    if st.button("🔄 Refresh detailed results from DB"):
+        with st.spinner("Refreshing..."):
+            try:
+                detailed = db.run_matching_query(vacancy_id)
+                if detailed is None or detailed.empty:
+                    st.warning("No detailed results returned on refresh.")
+                else:
+                    # normalize
+                    if 'final_match_rate' in detailed.columns and 'final_match_rate_percentage' not in detailed.columns:
+                        detailed = detailed.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
+                    if 'final_match_rate_percentage' in detailed.columns:
+                        detailed['final_match_rate_percentage'] = pd.to_numeric(detailed['final_match_rate_percentage'], errors='coerce')
+                        maxv = detailed['final_match_rate_percentage'].max(skipna=True)
+                        if pd.notna(maxv) and maxv <= 1.0:
+                            detailed['final_match_rate_percentage'] = detailed['final_match_rate_percentage'] * 100.0
+                    st.session_state.matching_results_detailed = detailed
+                    # refresh summary
+                    summ = detailed.groupby('employee_id').agg({
+                        'fullname': 'first',
+                        'directorate': 'first',
+                        'role': 'first',
+                        'grade': 'first',
+                        'final_match_rate_percentage': 'first'
+                    }).reset_index()
+                    summ['final_match_rate_percentage'] = pd.to_numeric(summ['final_match_rate_percentage'], errors='coerce')
+                    st.session_state.matching_results_summary = summ.sort_values('final_match_rate_percentage', ascending=False)
+                    st.success("Refreshed detailed results.")
+            except Exception as e:
+                st.exception(e)
+
 def show_analytics_page():
     """Page with visualizations and analytics"""
     st.markdown("## 📈 Analytics & Insights")
 
-    # Check if results available
-    if not st.session_state.vacancy_created or st.session_state.matching_results is None:
-        st.warning("⚠️ No results available. Please create a vacancy first.")
+    # Prefer detailed results for analytics
+    detailed = st.session_state.get('matching_results_detailed', None)
+    summary = st.session_state.get('matching_results_summary', None)
+    vacancy_id = st.session_state.get('job_vacancy_id', None)
+
+    if detailed is None or (isinstance(detailed, pd.DataFrame) and detailed.empty):
+        # try to inform user to load detailed results first
+        st.warning("⚠️ No detailed results available. Please load or refresh results from 'View Results'.")
         return
 
-    results_df = st.session_state.matching_results.copy() if isinstance(st.session_state.matching_results, pd.DataFrame) else st.session_state.matching_results
-    vacancy_id = st.session_state.job_vacancy_id
+    # Normalize final_match_rate column
+    if 'final_match_rate' in detailed.columns and 'final_match_rate_percentage' not in detailed.columns:
+        detailed = detailed.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
+    if 'final_match_rate_percentage' in detailed.columns:
+        detailed['final_match_rate_percentage'] = pd.to_numeric(detailed['final_match_rate_percentage'], errors='coerce')
+        maxv = detailed['final_match_rate_percentage'].max(skipna=True)
+        if pd.notna(maxv) and maxv <= 1.0:
+            detailed['final_match_rate_percentage'] = detailed['final_match_rate_percentage'] * 100.0
 
-    # COMPUTE summary from detailed results
-    # handle both column name variants safely
-    if isinstance(results_df, pd.DataFrame):
-        if 'final_match_rate' not in results_df.columns and 'final_match_rate_percentage' in results_df.columns:
-            results_df['final_match_rate'] = pd.to_numeric(results_df['final_match_rate_percentage'], errors='coerce')
-
-        summary_df = results_df.groupby('employee_id').agg({
+    # build summary if missing
+    if summary is None or summary.empty:
+        summary = detailed.groupby('employee_id').agg({
             'fullname': 'first',
             'directorate': 'first',
             'role': 'first',
             'grade': 'first',
-            'final_match_rate': 'first'
+            'final_match_rate_percentage': 'first'
         }).reset_index()
-
-        summary_df = summary_df.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
-
-        # Convert to numeric and drop NaN
-        summary_df['final_match_rate_percentage'] = pd.to_numeric(
-            summary_df['final_match_rate_percentage'],
-            errors='coerce'
-        )
-        summary_df = summary_df.dropna(subset=['final_match_rate_percentage'])
-
-        summary_df = summary_df.sort_values('final_match_rate_percentage', ascending=False).head(100)
-    else:
-        st.error("Unexpected matching_results format.")
-        return
+        summary['final_match_rate_percentage'] = pd.to_numeric(summary['final_match_rate_percentage'], errors='coerce')
+        summary = summary.dropna(subset=['final_match_rate_percentage'])
+        st.session_state.matching_results_summary = summary
 
     # Check if we have data
-    if summary_df.empty:
-        st.warning("⚠️ No valid matching results found.")
+    if summary.empty:
+        st.warning("⚠️ No valid matching summary found.")
         return
 
     # Key insights
     st.markdown("### 🔍 Key Insights")
-
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
-        avg_match = summary_df['final_match_rate_percentage'].mean()
+        avg_match = summary['final_match_rate_percentage'].mean()
         st.metric("Avg Match Rate", f"{avg_match:.1f}%")
 
     with col2:
-        top_match = summary_df['final_match_rate_percentage'].max()
+        top_match = summary['final_match_rate_percentage'].max()
         st.metric("Top Match", f"{top_match:.1f}%")
 
     with col3:
-        candidates_above_70 = (summary_df['final_match_rate_percentage'] >= 70).sum()
+        candidates_above_70 = (summary['final_match_rate_percentage'] >= 70).sum()
         st.metric("Matches ≥70%", candidates_above_70)
 
     with col4:
-        candidates_above_80 = (summary_df['final_match_rate_percentage'] >= 80).sum()
+        candidates_above_80 = (summary['final_match_rate_percentage'] >= 80).sum()
         st.metric("Matches ≥80%", candidates_above_80)
 
     st.markdown("---")
@@ -577,7 +630,7 @@ def show_analytics_page():
     with col1:
         st.markdown("#### 📊 Match Score Distribution")
         try:
-            fig_dist = plot_match_distribution(summary_df)
+            fig_dist = plot_match_distribution(summary)
             st.plotly_chart(fig_dist, width='stretch')
         except Exception as e:
             st.error(f"Error creating distribution chart: {e}")
@@ -585,7 +638,7 @@ def show_analytics_page():
     with col2:
         st.markdown("#### 🏆 Top 10 Candidates")
         try:
-            fig_top = plot_top_candidates(summary_df, top_n=10)
+            fig_top = plot_top_candidates(summary, top_n=10)
             st.plotly_chart(fig_top, width='stretch')
         except Exception as e:
             st.error(f"Error creating top candidates chart: {e}")
@@ -595,9 +648,17 @@ def show_analytics_page():
     # TGV Analysis
     st.markdown("### 📊 TGV-Level Analysis")
 
-    # Select employee for radar chart
-    employee_options = summary_df.head(20)['employee_id'].tolist()
+    # build per-employee tgv summary for selection list (use detailed)
+    try:
+        tgv_summary = detailed[['employee_id', 'fullname']].drop_duplicates().copy()
+        if 'final_match_rate_percentage' in summary.columns:
+            tgv_summary = tgv_summary.merge(summary[['employee_id', 'final_match_rate_percentage']], on='employee_id', how='left')
+        tgv_summary = tgv_summary.sort_values('final_match_rate_percentage', ascending=False).head(200)
+    except Exception:
+        st.error("Cannot prepare TGV employee list.")
+        return
 
+    employee_options = tgv_summary['employee_id'].tolist()
     if not employee_options:
         st.warning("No employees found in results.")
         return
@@ -605,7 +666,7 @@ def show_analytics_page():
     selected_employee = st.selectbox(
         "Select Employee for TGV Profile:",
         options=employee_options,
-        format_func=lambda x: f"{x} - {summary_df[summary_df['employee_id']==x]['fullname'].iloc[0]} ({summary_df[summary_df['employee_id']==x]['final_match_rate_percentage'].iloc[0]:.1f}%)"
+        format_func=lambda x: f"{x} - {tgv_summary[tgv_summary['employee_id']==x]['fullname'].iloc[0]} ({tgv_summary[tgv_summary['employee_id']==x]['final_match_rate_percentage'].iloc[0]:.1f}%)"
     )
 
     col1, col2 = st.columns(2)
@@ -613,7 +674,7 @@ def show_analytics_page():
     with col1:
         st.markdown("#### 🎯 TGV Radar Profile")
         try:
-            fig_radar = plot_tgv_radar(results_df, selected_employee)
+            fig_radar = plot_tgv_radar(detailed, selected_employee)
             st.plotly_chart(fig_radar, width='stretch')
         except Exception as e:
             st.error(f"Error creating radar chart: {e}")
@@ -621,7 +682,7 @@ def show_analytics_page():
     with col2:
         st.markdown("#### 🔥 TV Heatmap (Top TGVs)")
         try:
-            fig_heatmap = plot_tv_heatmap(results_df, selected_employee)
+            fig_heatmap = plot_tv_heatmap(detailed, selected_employee)
             st.plotly_chart(fig_heatmap, width='stretch')
         except Exception as e:
             st.error(f"Error creating heatmap: {e}")
@@ -630,9 +691,8 @@ def show_analytics_page():
 
     # Strengths & Gaps
     st.markdown("### ✅ Strengths & Gaps Analysis")
-
     try:
-        fig_strengths_gaps = plot_strengths_gaps(results_df, selected_employee)
+        fig_strengths_gaps = plot_strengths_gaps(detailed, selected_employee)
         st.plotly_chart(fig_strengths_gaps, width='stretch')
     except Exception as e:
         st.error(f"Error creating strengths/gaps chart: {e}")
