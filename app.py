@@ -5,10 +5,6 @@ AI-Powered Talent Matching Dashboard
 
 Author: TRI ADI BASKORO (revised)
 Date: 18 November 2025
-
-Notes:
-- This file expects utils.database.DatabaseManager and utils.visualizations functions to exist.
-- Replace/extend generate_fallback_profile as desired.
 """
 
 import streamlit as st
@@ -176,7 +172,7 @@ def show_home_page():
             )
         except Exception:
             # Fallback for Streamlit versions without column_config features
-            st.dataframe(recent_vacancies.head(10), use_container_width=True)
+            st.dataframe(recent_vacancies.head(10), width='stretch')
     else:
         st.info("No vacancies created yet. Go to 'Create Vacancy' to get started!")
 
@@ -343,7 +339,6 @@ def show_create_vacancy_page():
 
 def show_results_page():
     """Robust Results page: reads summary from session or from tb_final_aggregation fallback."""
-
     st.markdown("## 📊 Talent Matching Results")
 
     # If no vacancy in session, allow load existing (same logic as before)
@@ -361,7 +356,7 @@ def show_results_page():
             format_func=lambda x: f"ID {x}: {existing[existing['job_vacancy_id']==x]['role_name'].iloc[0]}"
         )
 
-                if st.button("📥 Load Results"):
+        if st.button("📥 Load Results"):
             with st.spinner("Loading..."):
                 try:
                     vac_id = int(selected) if isinstance(selected, (str,)) and str(selected).isdigit() else selected
@@ -420,7 +415,7 @@ def show_results_page():
 
                     # Store both summary and detailed in session_state
                     st.session_state.job_vacancy_id = vac_id
-                    st.session_state.matching_results = summary_df.copy()
+                    st.session_state.matching_results_summary = summary_df.copy()
                     st.session_state.matching_results_detailed = detailed.copy() if isinstance(detailed, pd.DataFrame) else pd.DataFrame()
                     st.session_state.vacancy_created = True
 
@@ -458,7 +453,7 @@ def show_results_page():
             if isinstance(raw, pd.DataFrame) and not raw.empty:
                 raw = raw.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
                 raw['final_match_rate_percentage'] = pd.to_numeric(raw['final_match_rate_percentage'], errors='coerce')
-                st.dataframe(raw.head(200), use_container_width=True)
+                st.dataframe(raw.head(200), width='stretch')
             else:
                 st.info("No rows in tb_final_aggregation to show.")
         except Exception as e:
@@ -486,11 +481,11 @@ def show_results_page():
                 )
             },
             hide_index=True,
-            use_container_width=True,
+            width='stretch',
             height=600
         )
     except Exception:
-        st.dataframe(df_sorted.head(20), use_container_width=True)
+        st.dataframe(df_sorted.head(20), width='stretch')
 
     # Download
     csv = df_sorted.to_csv(index=False)
