@@ -5,6 +5,10 @@ AI-Powered Talent Matching Dashboard
 
 Author: TRI ADI BASKORO (revised)
 Date: 18 November 2025
+
+Notes:
+- This file expects utils.database.DatabaseManager and utils.visualizations functions to exist.
+- Replace/extend generate_fallback_profile as desired.
 """
 
 import streamlit as st
@@ -61,6 +65,20 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+# Simple fallback generator for job profile (used if LLM fails)
+def generate_fallback_profile(role_name: str, job_level: str, role_purpose: str) -> dict:
+    """Return a basic fallback job profile."""
+    return {
+        "requirements": f"Experience in {role_name}, level: {job_level}. {role_purpose}",
+        "description": f"{role_name} — {job_level}. {role_purpose}",
+        "competencies": [
+            "Analytical thinking",
+            "Problem solving",
+            "Communication",
+            "Domain knowledge"
+        ]
+    }
 
 # Initialize session state
 if 'vacancy_created' not in st.session_state:
@@ -135,23 +153,26 @@ def show_home_page():
     except Exception:
         recent_vacancies = pd.DataFrame()
 
-    if not recent_vacancies.empty:
+    if isinstance(recent_vacancies, pd.DataFrame) and not recent_vacancies.empty:
         # Use width='stretch' as replacement for use_container_width
-        st.dataframe(
-            recent_vacancies,
-            column_config={
-                "job_vacancy_id": "ID",
-                "role_name": "Role",
-                "job_level": "Level",
-                "created_at": st.column_config.DatetimeColumn("Created", format="DD MMM YYYY"),
-                "benchmark_count": st.column_config.NumberColumn("Benchmarks", format="%d")
-            },
-            hide_index=True,
-            width='stretch'
-        )
+        try:
+            st.dataframe(
+                recent_vacancies,
+                column_config={
+                    "job_vacancy_id": "ID",
+                    "role_name": "Role",
+                    "job_level": "Level",
+                    "created_at": st.column_config.DatetimeColumn("Created", format="DD MMM YYYY"),
+                    "benchmark_count": st.column_config.NumberColumn("Benchmarks", format="%d")
+                },
+                hide_index=True,
+                width='stretch'
+            )
+        except Exception:
+            # Fallback for Streamlit versions without column_config features
+            st.dataframe(recent_vacancies.head(10), use_container_width=True)
     else:
         st.info("No vacancies created yet. Go to 'Create Vacancy' to get started!")
-
 
 def show_create_vacancy_page():
     """Page for creating new job vacancy"""
@@ -179,21 +200,23 @@ def show_create_vacancy_page():
         with col2:
             high_performers_df = db.get_high_performers()
             
-            if high_performers_df.empty:
+            if not isinstance(high_performers_df, pd.DataFrame) or high_performers_df.empty:
                 st.error("No high performers found!")
                 selected_employees = []
             else:
-                employee_options = high_performers_df.apply(
-                    lambda x: f"{x['employee_id']} - {x['fullname']} ({x['position']})", 
-                    axis=1
-                ).tolist()
-                
-                selected_options = st.multiselect(
+                # safer options: use employee_id as option value, show label via format_func
+                id_list = high_performers_df['employee_id'].astype(str).tolist()
+                id_to_label = {
+                    str(row['employee_id']): f"{row['employee_id']} - {row['fullname']} ({row.get('position','')})"
+                    for _, row in high_performers_df.iterrows()
+                }
+                selected_ids = st.multiselect(
                     "Select Benchmark Employees *",
-                    options=employee_options,
-                    max_selections=5
+                    options=id_list,
+                    format_func=lambda eid: id_to_label.get(str(eid), str(eid)),
+                    help="Pilih minimal 2 benchmark"
                 )
-                selected_employees = [opt.split(' - ')[0] for opt in selected_options]
+                selected_employees = [str(x) for x in selected_ids]
         
         role_purpose = st.text_area(
             "Role Purpose *",
@@ -229,13 +252,13 @@ def show_create_vacancy_page():
             # 2. Generate AI profile
             with st.spinner("🤖 Generating job profile with AI..."):
                 try:
+                    # Prepare benchmark employees DF for LLM
+                    benchmarks_df = high_performers_df[high_performers_df['employee_id'].isin(selected_employees)]
                     job_profile = generate_job_profile(
                         role_name=role_name,
                         job_level=job_level,
                         role_purpose=role_purpose,
-                        benchmark_employees=high_performers_df[
-                            high_performers_df['employee_id'].isin(selected_employees)
-                        ]
+                        benchmark_employees=benchmarks_df
                     )
                 except Exception as e:
                     st.warning(f"AI generation failed: {e}. Using fallback.")
@@ -246,8 +269,8 @@ def show_create_vacancy_page():
                 try:
                     matching_results = db.run_matching_query(vacancy_id)
                     
-                    if matching_results.empty:
-                        st.error("❌ Matching returned no results. Check your data.")
+                    if not isinstance(matching_results, pd.DataFrame) or matching_results.empty:
+                        st.error("❌ Matching returned no results. Check your data or pipeline logs.")
                         st.stop()
                     
                     st.success(f"✅ Matched {len(matching_results)} records!")
@@ -260,7 +283,7 @@ def show_create_vacancy_page():
             # 4. Save to session state
             st.session_state.vacancy_created = True
             st.session_state.job_vacancy_id = vacancy_id
-            st.session_state.matching_results = matching_results
+            st.session_state.matching_results = matching_results.copy() if isinstance(matching_results, pd.DataFrame) else matching_results
             st.session_state.job_profile = job_profile
             
             # 5. DISPLAY AI JOB PROFILE (THIS IS CRITICAL!)
@@ -292,73 +315,162 @@ def show_create_vacancy_page():
             st.info("👉 Go to **'View Results'** or **'Analytics'** to see detailed insights!")
 
 def show_results_page():
-    """Page showing matching results"""
-    
+    """Page showing matching results (robust + debug outputs)."""
+
     st.markdown("## 📊 Talent Matching Results")
-    
-    # Check session state
+
+    # If no vacancy in session, allow load existing (same logic as before)
     if not st.session_state.get('vacancy_created', False):
         st.warning("⚠️ No vacancy created yet. Create one or load existing.")
-        
-        # Load existing vacancy
+
         existing = db.get_recent_vacancies(20)
-        if not existing.empty:
-            selected = st.selectbox("Select vacancy:", existing['job_vacancy_id'],
-                                   format_func=lambda x: f"ID {x}: {existing[existing['job_vacancy_id']==x]['role_name'].iloc[0]}")
-            
-            if st.button("📥 Load Results"):
-                with st.spinner("Loading..."):
-                    st.session_state.job_vacancy_id = selected
-                    st.session_state.matching_results = db.run_matching_query(selected)
-                    st.session_state.vacancy_created = True
-                    st.rerun()
+        if not isinstance(existing, pd.DataFrame) or existing.empty:
+            st.info("No vacancies found in DB (recent_vacancies is empty).")
+            return
+
+        selected = st.selectbox(
+            "Select vacancy:",
+            options=existing['job_vacancy_id'].tolist(),
+            format_func=lambda x: f"ID {x}: {existing[existing['job_vacancy_id']==x]['role_name'].iloc[0]}"
+        )
+
+        if st.button("📥 Load Results"):
+            with st.spinner("Loading..."):
+                try:
+                    # Defensive casting for id
+                    vac_id = int(selected) if isinstance(selected, (str,)) and selected.isdigit() else selected
+                    df = db.run_matching_query(vac_id)
+
+                    st.write("DEBUG: run_matching_query returned type:", type(df))
+                    if isinstance(df, pd.DataFrame):
+                        st.write("DEBUG: run_matching_query shape:", df.shape)
+                        st.write("DEBUG: run_matching_query columns:", list(df.columns))
+                        # show a small sample for inspection
+                        if not df.empty:
+                            st.dataframe(df.head(10))
+                    else:
+                        st.write("DEBUG: run_matching_query did not return a DataFrame. Value:", df)
+
+                    # if DataFrame and has rows -> set session state
+                    if isinstance(df, pd.DataFrame) and not df.empty:
+                        st.session_state.job_vacancy_id = vac_id
+                        st.session_state.matching_results = df.copy()
+                        st.session_state.vacancy_created = True
+                        st.success(f"Loaded vacancy {vac_id} — {len(df)} records")
+                        st.experimental_rerun()
+                    else:
+                        st.error("No matching results returned for this vacancy. Please check the pipeline output or run matching again.")
+                except Exception as e:
+                    st.exception(e)
         return
-    
-    # Get data
+
+    # At this point, session contains matching_results
     results_df = st.session_state.matching_results
     vacancy_id = st.session_state.job_vacancy_id
-    
-    if results_df is None or results_df.empty:
-        st.error("No results available.")
+
+    if results_df is None:
+        st.error("matching_results is None in session_state.")
         return
-    
-    # Create summary
-    summary_df = results_df.groupby('employee_id').agg({
-        'fullname': 'first',
-        'directorate': 'first',
-        'role': 'first',
-        'grade': 'first',
-        'final_match_rate': 'first'
-    }).reset_index()
-    
+    if isinstance(results_df, pd.DataFrame) and results_df.empty:
+        st.error("matching_results DataFrame is empty.")
+        # show raw fallback table (if available in DB)
+        try:
+            st.info("Trying fallback: load tb_final_aggregation from DB for inspection...")
+            fallback = db.execute_query("SELECT * FROM tb_final_aggregation ORDER BY final_match_rate DESC LIMIT 200", fetch=True)
+            if isinstance(fallback, pd.DataFrame) and not fallback.empty:
+                st.dataframe(fallback.head(50))
+            else:
+                st.write("Fallback tb_final_aggregation appears empty.")
+        except Exception as e:
+            st.write("Fallback error:", e)
+        return
+
+    # Show debug summary for developer
+    st.markdown("**DEBUG: matching_results quick info**")
+    st.write("Type:", type(results_df))
+    st.write("Shape:", getattr(results_df, "shape", "n/a"))
+    st.write("Columns:", list(results_df.columns))
+
+    # Work on a copy to avoid mutating session state object
+    df_work = results_df.copy()
+
+    # Ensure final_match_rate column exists (some pipelines might name it differently)
+    if 'final_match_rate' not in df_work.columns and 'final_match_rate_percentage' in df_work.columns:
+        df_work['final_match_rate'] = df_work['final_match_rate_percentage']
+
+    # If final_match_rate still missing, try to pick a numeric candidate
+    if 'final_match_rate' not in df_work.columns:
+        candidates = [c for c in df_work.columns if any(k in c.lower() for k in ('final','match','score'))]
+        st.write("DEBUG: potential candidate columns for final score:", candidates)
+        for c in candidates:
+            if pd.api.types.is_numeric_dtype(df_work[c]):
+                df_work['final_match_rate'] = df_work[c]
+                st.write(f"DEBUG: using column '{c}' as final_match_rate fallback")
+                break
+
+    # Convert to numeric
+    df_work['final_match_rate'] = pd.to_numeric(df_work['final_match_rate'], errors='coerce')
+
+    # If values are in 0..1 scale (max <= 1.0) convert to percent
+    max_val = df_work['final_match_rate'].max(skipna=True)
+    if pd.notna(max_val) and max_val <= 1.0:
+        st.write("DEBUG: detected final_match_rate in 0..1 scale; converting to percentage.")
+        df_work['final_match_rate'] = df_work['final_match_rate'] * 100.0
+
+    # Build summary (one row per employee)
+    try:
+        summary_df = df_work.groupby('employee_id').agg({
+            'fullname': 'first',
+            'directorate': 'first',
+            'role': 'first',
+            'grade': 'first',
+            'final_match_rate': 'first'
+        }).reset_index()
+    except Exception as e:
+        st.exception(e)
+        st.write("DEBUG: could not group results_df; showing raw head")
+        st.dataframe(df_work.head(50))
+        return
+
+    # Rename column for UI
     summary_df = summary_df.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
+
+    # Convert and drop NA scores (but only if we have at least one non-null)
     summary_df['final_match_rate_percentage'] = pd.to_numeric(summary_df['final_match_rate_percentage'], errors='coerce')
-    summary_df = summary_df.dropna(subset=['final_match_rate_percentage'])
+
+    if summary_df['final_match_rate_percentage'].dropna().empty:
+        st.warning("All final match scores are missing (NaN). Showing raw detailed results for inspection.")
+        st.dataframe(df_work.head(200))
+        return
+
+    # Sort by match rate and show top 20
     summary_df = summary_df.sort_values('final_match_rate_percentage', ascending=False)
-    
-    # Display
+
     st.markdown("### 🏆 Top 20 Candidates")
-    
-    st.dataframe(
-        summary_df.head(20),
-        column_config={
-            "employee_id": "ID",
-            "fullname": "Name",
-            "directorate": "Directorate",
-            "role": "Current Role",
-            "grade": "Grade",
-            "final_match_rate_percentage": st.column_config.ProgressColumn(
-                "Match Score",
-                format="%.2f%%",
-                min_value=0,
-                max_value=100
-            )
-        },
-        hide_index=True,
-        use_container_width=True,
-        height=600
-    )
-    
+    try:
+        st.dataframe(
+            summary_df.head(20),
+            column_config={
+                "employee_id": "ID",
+                "fullname": "Name",
+                "directorate": "Directorate",
+                "role": "Current Role",
+                "grade": "Grade",
+                "final_match_rate_percentage": st.column_config.ProgressColumn(
+                    "Match Score",
+                    format="%.2f%%",
+                    min_value=0,
+                    max_value=100
+                )
+            },
+            hide_index=True,
+            use_container_width=True,
+            height=600
+        )
+    except Exception:
+        # Fallback for Streamlit versions without column_config support
+        st.dataframe(summary_df.head(20), use_container_width=True)
+
     # Download
     csv = summary_df.to_csv(index=False)
     st.download_button(
@@ -377,32 +489,36 @@ def show_analytics_page():
         st.warning("⚠️ No results available. Please create a vacancy first.")
         return
 
-    results_df = st.session_state.matching_results
+    results_df = st.session_state.matching_results.copy() if isinstance(st.session_state.matching_results, pd.DataFrame) else st.session_state.matching_results
     vacancy_id = st.session_state.job_vacancy_id
 
     # COMPUTE summary from detailed results
     # handle both column name variants safely
-    if 'final_match_rate' not in results_df.columns and 'final_match_rate_percentage' in results_df.columns:
-        results_df['final_match_rate'] = pd.to_numeric(results_df['final_match_rate_percentage'], errors='coerce')
+    if isinstance(results_df, pd.DataFrame):
+        if 'final_match_rate' not in results_df.columns and 'final_match_rate_percentage' in results_df.columns:
+            results_df['final_match_rate'] = pd.to_numeric(results_df['final_match_rate_percentage'], errors='coerce')
 
-    summary_df = results_df.groupby('employee_id').agg({
-        'fullname': 'first',
-        'directorate': 'first',
-        'role': 'first',
-        'grade': 'first',
-        'final_match_rate': 'first'
-    }).reset_index()
+        summary_df = results_df.groupby('employee_id').agg({
+            'fullname': 'first',
+            'directorate': 'first',
+            'role': 'first',
+            'grade': 'first',
+            'final_match_rate': 'first'
+        }).reset_index()
 
-    summary_df = summary_df.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
+        summary_df = summary_df.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
 
-    # Convert to numeric and drop NaN
-    summary_df['final_match_rate_percentage'] = pd.to_numeric(
-        summary_df['final_match_rate_percentage'],
-        errors='coerce'
-    )
-    summary_df = summary_df.dropna(subset=['final_match_rate_percentage'])
+        # Convert to numeric and drop NaN
+        summary_df['final_match_rate_percentage'] = pd.to_numeric(
+            summary_df['final_match_rate_percentage'],
+            errors='coerce'
+        )
+        summary_df = summary_df.dropna(subset=['final_match_rate_percentage'])
 
-    summary_df = summary_df.sort_values('final_match_rate_percentage', ascending=False).head(100)
+        summary_df = summary_df.sort_values('final_match_rate_percentage', ascending=False).head(100)
+    else:
+        st.error("Unexpected matching_results format.")
+        return
 
     # Check if we have data
     if summary_df.empty:
@@ -497,7 +613,6 @@ def show_analytics_page():
         st.plotly_chart(fig_strengths_gaps, width='stretch')
     except Exception as e:
         st.error(f"Error creating strengths/gaps chart: {e}")
-
 
 # ================
 # Main app (at bottom)
