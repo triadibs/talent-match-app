@@ -315,7 +315,7 @@ def show_create_vacancy_page():
             st.info("👉 Go to **'View Results'** or **'Analytics'** to see detailed insights!")
 
 def show_results_page():
-    """Page showing matching results (robust + debug outputs)."""
+    """Page showing matching results (robust + compatible rerun)."""
 
     st.markdown("## 📊 Talent Matching Results")
 
@@ -345,7 +345,7 @@ def show_results_page():
                     if isinstance(df, pd.DataFrame):
                         st.write("DEBUG: run_matching_query shape:", df.shape)
                         st.write("DEBUG: run_matching_query columns:", list(df.columns))
-                        # show a small sample for inspection
+                        # show a small sample for inspection (avoid huge prints)
                         if not df.empty:
                             st.dataframe(df.head(10))
                     else:
@@ -354,17 +354,66 @@ def show_results_page():
                     # if DataFrame and has rows -> set session state
                     if isinstance(df, pd.DataFrame) and not df.empty:
                         st.session_state.job_vacancy_id = vac_id
-                        st.session_state.matching_results = df.copy()
-                        st.session_state.vacancy_created = True
-                        st.success(f"Loaded vacancy {vac_id} — {len(df)} records")
-                        st.experimental_rerun()
+
+                        # --- IMPORTANT: store a lightweight summary for the Results page ---
+                        # Attempt to get a compact summary (one row per employee) to show in Results.
+                        try:
+                            # Prefer to use DB-side summary if available
+                            summary_df = db.get_summary_results(vac_id, limit=5000)
+                            if not isinstance(summary_df, pd.DataFrame) or summary_df.empty:
+                                # Fallback: build summary from the detailed df (but avoid storing full df)
+                                tmp = df.copy()
+                                # prefer column named final_match_rate if exists
+                                if 'final_match_rate' not in tmp.columns and 'final_match_rate_percentage' in tmp.columns:
+                                    tmp['final_match_rate'] = tmp['final_match_rate_percentage']
+                                tmp['final_match_rate'] = pd.to_numeric(tmp.get('final_match_rate'), errors='coerce')
+                                summary_df = tmp.groupby('employee_id').agg({
+                                    'fullname': 'first',
+                                    'directorate': 'first',
+                                    'role': 'first',
+                                    'grade': 'first',
+                                    'final_match_rate': 'first'
+                                }).reset_index().rename(columns={'final_match_rate': 'final_match_rate_percentage'})
+                                # ensure numeric percent scale (if values between 0..1)
+                                if summary_df['final_match_rate_percentage'].max(skipna=True) <= 1.0:
+                                    summary_df['final_match_rate_percentage'] = summary_df['final_match_rate_percentage'] * 100.0
+                        except Exception:
+                            # Last-resort: compute summary from df inline
+                            tmp = df.copy()
+                            if 'final_match_rate' not in tmp.columns and 'final_match_rate_percentage' in tmp.columns:
+                                tmp['final_match_rate'] = tmp['final_match_rate_percentage']
+                            tmp['final_match_rate'] = pd.to_numeric(tmp.get('final_match_rate'), errors='coerce')
+                            summary_df = tmp.groupby('employee_id').agg({
+                                'fullname': 'first',
+                                'directorate': 'first',
+                                'role': 'first',
+                                'grade': 'first',
+                                'final_match_rate': 'first'
+                            }).reset_index().rename(columns={'final_match_rate': 'final_match_rate_percentage'})
+                            if summary_df['final_match_rate_percentage'].max(skipna=True) <= 1.0:
+                                summary_df['final_match_rate_percentage'] = summary_df['final_match_rate_percentage'] * 100.0
+
+                        # store only summary to session_state to save memory
+                        st.session_state.matching_results = summary_df.copy()
+                        # keep detailed df off session by default, but keep a pointer if you want:
+                        st.session_state._last_matching_full_df_available = True  # flag only
+
+                        st.success(f"Loaded vacancy {vac_id} — summary {len(summary_df)} rows")
+
+                        # Try to rerun if Streamlit provides experimental_rerun; otherwise give instruction
+                        rerun = getattr(st, "experimental_rerun", None)
+                        if callable(rerun):
+                            rerun()
+                        else:
+                            st.info("Results loaded. If the page did not refresh automatically, please navigate to 'View Results' again or refresh the page.")
+                            return
                     else:
                         st.error("No matching results returned for this vacancy. Please check the pipeline output or run matching again.")
                 except Exception as e:
                     st.exception(e)
         return
 
-    # At this point, session contains matching_results
+    # At this point, session contains matching_results (we store summary_df in session_state)
     results_df = st.session_state.matching_results
     vacancy_id = st.session_state.job_vacancy_id
 
@@ -376,7 +425,7 @@ def show_results_page():
         # show raw fallback table (if available in DB)
         try:
             st.info("Trying fallback: load tb_final_aggregation from DB for inspection...")
-            fallback = db.execute_query("SELECT * FROM tb_final_aggregation ORDER BY final_match_rate DESC LIMIT 200", fetch=True)
+            fallback = db.execute_query("SELECT * FROM tb_final_aggregation ORDER BY final_match_rate DESC LIMIT 200", params=None, fetch=True)
             if isinstance(fallback, pd.DataFrame) and not fallback.empty:
                 st.dataframe(fallback.head(50))
             else:
@@ -385,71 +434,32 @@ def show_results_page():
             st.write("Fallback error:", e)
         return
 
-    # Show debug summary for developer
-    st.markdown("**DEBUG: matching_results quick info**")
-    st.write("Type:", type(results_df))
-    st.write("Shape:", getattr(results_df, "shape", "n/a"))
-    st.write("Columns:", list(results_df.columns))
-
     # Work on a copy to avoid mutating session state object
     df_work = results_df.copy()
 
-    # Ensure final_match_rate column exists (some pipelines might name it differently)
-    if 'final_match_rate' not in df_work.columns and 'final_match_rate_percentage' in df_work.columns:
-        df_work['final_match_rate'] = df_work['final_match_rate_percentage']
+    # Ensure column name is final_match_rate_percentage for UI
+    if 'final_match_rate_percentage' not in df_work.columns and 'final_match_rate' in df_work.columns:
+        df_work = df_work.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
 
-    # If final_match_rate still missing, try to pick a numeric candidate
-    if 'final_match_rate' not in df_work.columns:
-        candidates = [c for c in df_work.columns if any(k in c.lower() for k in ('final','match','score'))]
-        st.write("DEBUG: potential candidate columns for final score:", candidates)
-        for c in candidates:
-            if pd.api.types.is_numeric_dtype(df_work[c]):
-                df_work['final_match_rate'] = df_work[c]
-                st.write(f"DEBUG: using column '{c}' as final_match_rate fallback")
-                break
+    # Convert to numeric and validate
+    df_work['final_match_rate_percentage'] = pd.to_numeric(df_work['final_match_rate_percentage'], errors='coerce')
 
-    # Convert to numeric
-    df_work['final_match_rate'] = pd.to_numeric(df_work['final_match_rate'], errors='coerce')
-
-    # If values are in 0..1 scale (max <= 1.0) convert to percent
-    max_val = df_work['final_match_rate'].max(skipna=True)
-    if pd.notna(max_val) and max_val <= 1.0:
-        st.write("DEBUG: detected final_match_rate in 0..1 scale; converting to percentage.")
-        df_work['final_match_rate'] = df_work['final_match_rate'] * 100.0
-
-    # Build summary (one row per employee)
-    try:
-        summary_df = df_work.groupby('employee_id').agg({
-            'fullname': 'first',
-            'directorate': 'first',
-            'role': 'first',
-            'grade': 'first',
-            'final_match_rate': 'first'
-        }).reset_index()
-    except Exception as e:
-        st.exception(e)
-        st.write("DEBUG: could not group results_df; showing raw head")
-        st.dataframe(df_work.head(50))
-        return
-
-    # Rename column for UI
-    summary_df = summary_df.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
-
-    # Convert and drop NA scores (but only if we have at least one non-null)
-    summary_df['final_match_rate_percentage'] = pd.to_numeric(summary_df['final_match_rate_percentage'], errors='coerce')
-
-    if summary_df['final_match_rate_percentage'].dropna().empty:
+    if df_work['final_match_rate_percentage'].dropna().empty:
         st.warning("All final match scores are missing (NaN). Showing raw detailed results for inspection.")
-        st.dataframe(df_work.head(200))
+        try:
+            raw = db.execute_query("SELECT * FROM tb_final_aggregation ORDER BY final_match_rate DESC LIMIT 200", params=None, fetch=True)
+            st.dataframe(raw.head(50))
+        except Exception:
+            st.dataframe(df_work.head(200))
         return
 
     # Sort by match rate and show top 20
-    summary_df = summary_df.sort_values('final_match_rate_percentage', ascending=False)
+    df_sorted = df_work.sort_values('final_match_rate_percentage', ascending=False)
 
     st.markdown("### 🏆 Top 20 Candidates")
     try:
         st.dataframe(
-            summary_df.head(20),
+            df_sorted.head(20),
             column_config={
                 "employee_id": "ID",
                 "fullname": "Name",
@@ -468,11 +478,10 @@ def show_results_page():
             height=600
         )
     except Exception:
-        # Fallback for Streamlit versions without column_config support
-        st.dataframe(summary_df.head(20), use_container_width=True)
+        st.dataframe(df_sorted.head(20), use_container_width=True)
 
     # Download
-    csv = summary_df.to_csv(index=False)
+    csv = df_sorted.to_csv(index=False)
     st.download_button(
         "📥 Download Results (CSV)",
         csv,
