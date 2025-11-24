@@ -510,6 +510,24 @@ class DatabaseManager:
                     """
 
                     df = pd.read_sql_query(final_sql, conn)
+                                        # read results into pandas DataFrame and sanitize numeric columns
+
+                    # safeguard: coerce numeric-like columns to numeric
+                    numeric_cols = ['baseline_score', 'user_score', 'tv_match_rate', 'tgv_match_rate', 'final_match_rate']
+                    for c in numeric_cols:
+                        if c in df.columns:
+                            df[c] = pd.to_numeric(df[c], errors='coerce')
+
+                    # ensure consistent naming: create final_match_rate_percentage if missing
+                    if 'final_match_rate' in df.columns and 'final_match_rate_percentage' not in df.columns:
+                        df = df.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
+
+                    # if values are in 0..1 scale, upscale to 0..100
+                    if 'final_match_rate_percentage' in df.columns:
+                        maxv = df['final_match_rate_percentage'].max(skipna=True)
+                        if pd.notna(maxv) and maxv <= 1.0:
+                            df['final_match_rate_percentage'] = df['final_match_rate_percentage'] * 100.0
+
                     return df
 
             except Exception as e:
