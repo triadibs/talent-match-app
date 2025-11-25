@@ -3,6 +3,7 @@
 """
 Database Manager for Talent Match System
 FIXED: Ensures tgv_match_rate and tv_match_rate are properly returned
+and selected_talent mapping is used consistently.
 """
 
 import psycopg
@@ -150,9 +151,9 @@ class DatabaseManager:
 
     def run_matching_query(self, job_vacancy_id: int) -> pd.DataFrame:
         """
-        FIXED: Complete matching pipeline that ensures all columns are present
+        Complete matching pipeline that ensures all columns are present
         Returns detailed per-TV rows with tgv_match_rate and tv_match_rate
-        (patched to map selected_talent_ids -> employees.employee_id robustly)
+        (uses mapped_employee_id for selected talents consistently)
         """
         with self.get_connection() as conn:
             try:
@@ -189,8 +190,8 @@ class DatabaseManager:
                         FROM competencies_yearly
                     """)
 
-                    # 3. Selected talents (PATCHED)
-                    # keep raw selected id and attempt to map to employees.employee_id using heuristics
+                    # 3. Selected talents (mapped to employees)
+                    # Keep raw selected id and attempt to map to employees.employee_id using heuristics
                     cur.execute(r"""
                         CREATE TABLE tb_selected_talents AS
                         WITH raw AS (
@@ -294,30 +295,30 @@ class DatabaseManager:
                               tv.tv_score
                             FROM tb_selected_talents st
                             JOIN tb_tv_scores_long tv
-                              ON tv.employee_id = st.employee_id
+                              ON tv.employee_id = st.mapped_employee_id
                         )
                         SELECT
                             job_vacancy_id,
                             tgv_name,
                             tv_name,
                             scoring_direction,
-                        
-                            -- baseline_mean fallback: use AVG, if NULL fallback to median, else fallback 0
+
+                            -- baseline_mean fallback: use AVG if possible else median, else 0
                             CASE
                                 WHEN AVG(tv_score) IS NOT NULL THEN AVG(tv_score)
                                 WHEN PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY tv_score) IS NOT NULL
                                     THEN PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY tv_score)
                                 ELSE 0
                             END AS baseline_mean,
-                        
+
                             -- stddev fallback: if all values same or no data → set 0
                             COALESCE(STDDEV_POP(tv_score), 0) AS baseline_stddev,
-                        
+
                             COUNT(*) AS benchmark_count
-                        
+
                         FROM raw_base
                         GROUP BY job_vacancy_id, tgv_name, tv_name, scoring_direction;
-                          """)
+                    """)
 
                     # 7. Employees with TV
                     cur.execute("""
