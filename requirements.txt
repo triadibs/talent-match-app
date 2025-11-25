@@ -3,6 +3,7 @@ pandas
 numpy
 plotly
 requests
-sqlalchemy
+sqlalchemy>=2.0.0
 psycopg[binary]
 python-dotenv
+
