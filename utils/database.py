@@ -317,7 +317,7 @@ class DatabaseManager:
                         
                         FROM raw_base
                         GROUP BY job_vacancy_id, tgv_name, tv_name, scoring_direction;
-
+                          """)
 
                     # 7. Employees with TV
                     cur.execute("""
