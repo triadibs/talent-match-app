@@ -625,7 +625,12 @@ def show_analytics_page():
 
     # build per-employee tgv summary for selection list (use detailed)
     try:
-        tgv_summary = detailed[['employee_id', 'fullname']].drop_duplicates().copy()
+        valid_emp = detailed[
+            detailed['tv_match_rate'].notna() | detailed['tgv_match_rate'].notna()
+        ].copy()
+
+        tgv_summary = valid_emp[['employee_id', 'fullname']].drop_duplicates()
+
         if 'final_match_rate_percentage' in summary.columns:
             tgv_summary = tgv_summary.merge(summary[['employee_id', 'final_match_rate_percentage']], on='employee_id', how='left')
         tgv_summary = tgv_summary.sort_values('final_match_rate_percentage', ascending=False).head(200)
