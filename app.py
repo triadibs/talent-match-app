@@ -1,8 +1,8 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-Talent Match Intelligence System - Step 3 (Revised)
-Resilient Streamlit app: normalizes data types before visualization and handles edge cases.
+Talent Match Intelligence System - Step 3 (Revised, hardened)
+Includes cleaning for placeholder/header-rows and robust handling when scores are missing.
 Author: TRI ADI BASKORO (revised)
 Date: 18 November 2025 (revised)
 """
@@ -11,8 +11,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime
-import json
-from typing import List
+from typing import List, Tuple
 
 # Custom modules (must exist)
 from utils.database import DatabaseManager
@@ -26,7 +25,7 @@ from utils.visualizations import (
 )
 
 # ----------------------------
-# Helpers
+# Helpers: cleaning + normalization
 # ----------------------------
 def _ensure_str_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     """Ensure listed columns are strings but preserve NaN as real NaN."""
@@ -35,11 +34,48 @@ def _ensure_str_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
         if c in df.columns:
             df[c] = df[c].astype(object).where(~df[c].isna(), other=np.nan)
             df[c] = df[c].apply(lambda x: x if pd.isna(x) or isinstance(x, str) else str(x))
+            # convert common literal tokens to NaN (defensive)
+            df[c] = df[c].replace({'': np.nan, 'nan': np.nan, 'None': np.nan, 'NaN': np.nan})
     return df
 
-def _normalize_results_dfs(detailed: pd.DataFrame, summary: pd.DataFrame = None):
+def _drop_placeholder_rows(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize the detailed and summary DataFrames:
+    Drop rows where many fields are equal to their column names (common when header repeated),
+    or where nearly all value cells are literal placeholders like 'employee_id', 'fullname', etc.
+    """
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    # Replace literal tokens with NaN strings first to make comparison consistent
+    df = df.replace({'': np.nan, 'nan': np.nan, 'None': np.nan, 'NaN': np.nan})
+    # build boolean mask: True if row looks like a header/placeholder row
+    def _is_placeholder_row(row):
+        # count how many cells equal to their column name (case-insensitive)
+        match_count = 0
+        total_checked = 0
+        for col, val in row.items():
+            # only check string-like values
+            if pd.isna(val):
+                continue
+            total_checked += 1
+            try:
+                if str(val).strip().lower() == str(col).strip().lower():
+                    match_count += 1
+            except Exception:
+                pass
+        # if majority of checked cells equal their column names -> placeholder
+        if total_checked == 0:
+            return False
+        return (match_count / total_checked) >= 0.6  # threshold: 60%
+    mask = df.apply(_is_placeholder_row, axis=1)
+    if mask.any():
+        df = df.loc[~mask].reset_index(drop=True)
+    return df
+
+def _normalize_results_dfs(detailed: pd.DataFrame, summary: pd.DataFrame = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Normalize and clean the detailed and summary DataFrames:
+      - drop placeholder rows
       - ensure key text columns are strings (employee_id, fullname, tgv_name, tv_name, role, grade, directorate)
       - coerce numeric final match column to percent (0..100)
       - return tuple (detailed_norm, summary_norm)
@@ -47,13 +83,17 @@ def _normalize_results_dfs(detailed: pd.DataFrame, summary: pd.DataFrame = None)
     if detailed is None:
         detailed = pd.DataFrame()
 
+    # Drop obvious placeholder/header rows (e.g., rows where values == column names)
+    detailed = _drop_placeholder_rows(detailed)
+
     # Standard text columns to protect .str usage later
     text_cols = ['employee_id', 'fullname', 'tgv_name', 'tv_name', 'role', 'grade', 'directorate', 'scale_code']
     detailed = _ensure_str_cols(detailed, text_cols)
 
     # Normalize employee_id as string
     if 'employee_id' in detailed.columns:
-        detailed['employee_id'] = detailed['employee_id'].astype(object).apply(lambda x: str(x) if pd.notna(x) else np.nan)
+        detailed['employee_id'] = detailed['employee_id'].astype(object).where(~detailed['employee_id'].isna(), other=np.nan)
+        detailed['employee_id'] = detailed['employee_id'].apply(lambda x: str(x).strip() if pd.notna(x) else np.nan)
 
     # Normalize final match rate column names and scale
     if 'final_match_rate' in detailed.columns and 'final_match_rate_percentage' not in detailed.columns:
@@ -69,7 +109,6 @@ def _normalize_results_dfs(detailed: pd.DataFrame, summary: pd.DataFrame = None)
     # Build summary from detailed if summary not provided
     if summary is None or (isinstance(summary, pd.DataFrame) and summary.empty):
         if not detailed.empty and 'employee_id' in detailed.columns:
-            # select best candidate for each employee
             cols_for_summary = ['employee_id', 'fullname', 'directorate', 'role', 'grade', 'final_match_rate_percentage']
             present = [c for c in cols_for_summary if c in detailed.columns]
             if present:
@@ -78,20 +117,21 @@ def _normalize_results_dfs(detailed: pd.DataFrame, summary: pd.DataFrame = None)
                 summary = pd.DataFrame()
         else:
             summary = pd.DataFrame()
+    else:
+        # if summary provided, also drop placeholder rows and normalize
+        summary = _drop_placeholder_rows(summary)
+        summary = _ensure_str_cols(summary, ['employee_id', 'fullname', 'role', 'grade', 'directorate'])
+        if 'employee_id' in summary.columns:
+            summary['employee_id'] = summary['employee_id'].apply(lambda x: str(x).strip() if pd.notna(x) else np.nan)
+        if 'final_match_rate_percentage' in summary.columns:
+            summary['final_match_rate_percentage'] = pd.to_numeric(summary['final_match_rate_percentage'], errors='coerce')
+            maxv = summary['final_match_rate_percentage'].max(skipna=True)
+            if pd.notna(maxv) and maxv <= 1.0:
+                summary['final_match_rate_percentage'] = summary['final_match_rate_percentage'] * 100.0
 
-    # Ensure summary text columns are strings and employee_id string
-    summary = _ensure_str_cols(summary, ['employee_id', 'fullname', 'role', 'grade', 'directorate'])
-    if 'employee_id' in summary.columns:
-        summary['employee_id'] = summary['employee_id'].astype(object).apply(lambda x: str(x) if pd.notna(x) else np.nan)
-
-    # Normalize numeric in summary
-    if 'final_match_rate_percentage' in summary.columns:
-        summary['final_match_rate_percentage'] = pd.to_numeric(summary['final_match_rate_percentage'], errors='coerce')
-        maxv = summary['final_match_rate_percentage'].max(skipna=True)
-        if pd.notna(maxv) and maxv <= 1.0:
-            summary['final_match_rate_percentage'] = summary['final_match_rate_percentage'] * 100.0
-
-    return detailed, summary
+    # final defensive conversions for tgv/tv names
+    detailed = _ensure_str_cols(detailed, ['tgv_name', 'tv_name'])
+    return detailed.reset_index(drop=True), (summary.reset_index(drop=True) if isinstance(summary, pd.DataFrame) else pd.DataFrame())
 
 # ----------------------------
 # Init DB
@@ -173,12 +213,7 @@ def generate_fallback_profile(role_name: str, job_level: str, role_purpose: str)
     return {
         "requirements": f"Experience in {role_name}, level: {job_level}. {role_purpose}",
         "description": f"{role_name} — {job_level}. {role_purpose}",
-        "competencies": [
-            "Analytical thinking",
-            "Problem solving",
-            "Communication",
-            "Domain knowledge"
-        ]
+        "competencies": ["Analytical thinking", "Problem solving", "Communication", "Domain knowledge"]
     }
 
 def show_create_vacancy_page():
@@ -196,7 +231,6 @@ def show_create_vacancy_page():
                 st.error("No high performers found!")
                 selected_employees = []
             else:
-                # safe conversion
                 high_performers_df = _ensure_str_cols(high_performers_df, ['employee_id', 'fullname', 'position'])
                 id_list = high_performers_df['employee_id'].astype(str).tolist()
                 id_to_label = {str(row['employee_id']): f"{row['employee_id']} - {row['fullname']} ({row.get('position','')})" for _, row in high_performers_df.iterrows()}
@@ -261,14 +295,18 @@ def show_create_vacancy_page():
                 if pd.notna(maxv) and maxv <= 1.0:
                     detailed['final_match_rate_percentage'] = detailed['final_match_rate_percentage'] * 100.0
 
-            summary_df = detailed.groupby('employee_id').agg({
-                'fullname': 'first',
-                'directorate': 'first',
-                'role': 'first',
-                'grade': 'first',
-                'final_match_rate_percentage': 'first'
-            }).reset_index()
-            summary_df['final_match_rate_percentage'] = pd.to_numeric(summary_df['final_match_rate_percentage'], errors='coerce')
+            # Clean placeholder/header rows before building summary
+            detailed = _drop_placeholder_rows(detailed)
+            summary_df = pd.DataFrame()
+            if not detailed.empty and 'employee_id' in detailed.columns:
+                # build summary defensively
+                cols_for_summary = ['employee_id', 'fullname', 'directorate', 'role', 'grade', 'final_match_rate_percentage']
+                present = [c for c in cols_for_summary if c in detailed.columns]
+                if present:
+                    summary_df = detailed[present].groupby('employee_id').first().reset_index()
+            # ensure numeric
+            if 'final_match_rate_percentage' in summary_df.columns:
+                summary_df['final_match_rate_percentage'] = pd.to_numeric(summary_df['final_match_rate_percentage'], errors='coerce')
 
             st.session_state.vacancy_created = True
             st.session_state.job_vacancy_id = vacancy_id
@@ -353,6 +391,8 @@ def show_results_page():
                         except Exception:
                             detailed = pd.DataFrame()
 
+                    # final cleaning
+                    detailed = _drop_placeholder_rows(detailed)
                     if 'final_match_rate_percentage' in summary_df.columns:
                         summary_df['final_match_rate_percentage'] = pd.to_numeric(summary_df['final_match_rate_percentage'], errors='coerce')
                         maxv = summary_df['final_match_rate_percentage'].max(skipna=True)
@@ -423,16 +463,19 @@ def show_results_page():
                         maxv = detailed['final_match_rate_percentage'].max(skipna=True)
                         if pd.notna(maxv) and maxv <= 1.0:
                             detailed['final_match_rate_percentage'] = detailed['final_match_rate_percentage'] * 100.0
+                    detailed = _drop_placeholder_rows(detailed)
                     st.session_state.matching_results_detailed = detailed
-                    summ = detailed.groupby('employee_id').agg({
-                        'fullname': 'first',
-                        'directorate': 'first',
-                        'role': 'first',
-                        'grade': 'first',
-                        'final_match_rate_percentage': 'first'
-                    }).reset_index()
-                    summ['final_match_rate_percentage'] = pd.to_numeric(summ['final_match_rate_percentage'], errors='coerce')
-                    st.session_state.matching_results_summary = summ.sort_values('final_match_rate_percentage', ascending=False)
+                    summ = pd.DataFrame()
+                    if not detailed.empty:
+                        summ = detailed.groupby('employee_id').agg({
+                            'fullname': 'first',
+                            'directorate': 'first',
+                            'role': 'first',
+                            'grade': 'first',
+                            'final_match_rate_percentage': 'first'
+                        }).reset_index()
+                        summ['final_match_rate_percentage'] = pd.to_numeric(summ['final_match_rate_percentage'], errors='coerce')
+                    st.session_state.matching_results_summary = summ.sort_values('final_match_rate_percentage', ascending=False) if not summ.empty else summ
                     st.success("Refreshed detailed results.")
             except Exception as e:
                 st.exception(e)
@@ -448,24 +491,28 @@ def show_analytics_page():
         st.warning("⚠️ No detailed results available. Please load or refresh results from 'View Results'.")
         return
 
-    # Normalize dataframes defensively
+    # Normalize and clean dataframes defensively (this also removes placeholder rows)
     detailed, summary = _normalize_results_dfs(detailed, summary)
 
     # build summary if missing after normalization
     if summary is None or summary.empty:
-        summary = detailed.groupby('employee_id').agg({
-            'fullname': 'first',
-            'directorate': 'first',
-            'role': 'first',
-            'grade': 'first',
-            'final_match_rate_percentage': 'first'
-        }).reset_index()
-        summary['final_match_rate_percentage'] = pd.to_numeric(summary['final_match_rate_percentage'], errors='coerce')
-        summary = summary.dropna(subset=['final_match_rate_percentage'])
-        st.session_state.matching_results_summary = summary
+        if not detailed.empty and 'employee_id' in detailed.columns:
+            summary = detailed.groupby('employee_id').agg({
+                'fullname': 'first',
+                'directorate': 'first',
+                'role': 'first',
+                'grade': 'first',
+                'final_match_rate_percentage': 'first'
+            }).reset_index()
+            summary['final_match_rate_percentage'] = pd.to_numeric(summary['final_match_rate_percentage'], errors='coerce')
+            summary = summary.dropna(subset=['final_match_rate_percentage'])
+            st.session_state.matching_results_summary = summary
 
-    if summary.empty:
-        st.warning("⚠️ No valid matching summary found.")
+    if summary is None or summary.empty:
+        st.warning("⚠️ No valid matching summary found after cleaning. Your detailed rows may be placeholders or missing numeric scores.")
+        # show a tiny sample to help debug
+        st.write("Sample detailed rows (post-clean):")
+        st.write(detailed.head(5))
         return
 
     st.markdown("### 🔍 Key Insights")
@@ -546,29 +593,68 @@ def show_analytics_page():
     with col1:
         st.markdown("#### 🎯 TGV Radar Profile")
         try:
-            fig_radar = plot_tgv_radar(detailed, selected_employee)
-            st.plotly_chart(fig_radar, width='stretch')
+            # quick guard: check if there are any numeric tgv_match_rate for this employee
+            emp_rows = detailed.loc[detailed['employee_id'].astype(str) == selected_employee]
+            # remove placeholder-like rows in emp_rows too
+            emp_rows = _drop_placeholder_rows(emp_rows)
+            if emp_rows.empty:
+                st.warning("No detailed rows for this employee after cleaning. The dataset may contain placeholder rows only.")
+                st.write(emp_rows.head(5))
+            else:
+                # check if any numeric tgv_match_rate exists
+                has_tgv_numeric = ('tgv_match_rate' in emp_rows.columns) and (pd.to_numeric(emp_rows['tgv_match_rate'], errors='coerce').dropna().size > 0)
+                if not has_tgv_numeric:
+                    st.warning("No numeric TGV match rate values for this employee. Radar cannot be created.")
+                    st.write(emp_rows.head(5))
+                else:
+                    fig_radar = plot_tgv_radar(emp_rows, selected_employee)
+                    st.plotly_chart(fig_radar, width='stretch')
         except Exception as e:
             st.error(f"Error creating radar chart: {e}")
-            # debugging info
-            st.write("Sample rows for this employee:", detailed.loc[detailed['employee_id'] == selected_employee].head(5).to_dict(orient='records'))
+            st.write("Sample rows for this employee (post-clean):")
+            st.write(emp_rows.head(5).to_dict(orient='records') if 'emp_rows' in locals() else "No emp_rows available")
+
     with col2:
         st.markdown("#### 🔥 TV Heatmap (Top TGVs)")
         try:
-            fig_heatmap = plot_tv_heatmap(detailed, selected_employee)
-            st.plotly_chart(fig_heatmap, width='stretch')
+            emp_rows = detailed.loc[detailed['employee_id'].astype(str) == selected_employee]
+            emp_rows = _drop_placeholder_rows(emp_rows)
+            if emp_rows.empty:
+                st.warning("No detailed rows for this employee after cleaning. Heatmap cannot be created.")
+                st.write(emp_rows.head(5))
+            else:
+                has_tv_numeric = ('tv_match_rate' in emp_rows.columns) and (pd.to_numeric(emp_rows['tv_match_rate'], errors='coerce').dropna().size > 0)
+                if not has_tv_numeric:
+                    st.warning("No numeric TV match rate values for this employee. Heatmap cannot be created.")
+                    st.write(emp_rows.head(5))
+                else:
+                    fig_heatmap = plot_tv_heatmap(emp_rows, selected_employee)
+                    st.plotly_chart(fig_heatmap, width='stretch')
         except Exception as e:
             st.error(f"Error creating heatmap: {e}")
-            st.write("Sample rows for this employee:", detailed.loc[detailed['employee_id'] == selected_employee].head(5).to_dict(orient='records'))
+            st.write("Sample rows for this employee (post-clean):")
+            st.write(emp_rows.head(5).to_dict(orient='records') if 'emp_rows' in locals() else "No emp_rows available")
 
     st.markdown("---")
     st.markdown("### ✅ Strengths & Gaps Analysis")
     try:
-        fig_strengths_gaps = plot_strengths_gaps(detailed, selected_employee)
-        st.plotly_chart(fig_strengths_gaps, width='stretch')
+        emp_rows = detailed.loc[detailed['employee_id'].astype(str) == selected_employee]
+        emp_rows = _drop_placeholder_rows(emp_rows)
+        if emp_rows.empty:
+            st.warning("No detailed rows for this employee after cleaning. Strengths & Gaps chart cannot be created.")
+            st.write(emp_rows.head(5))
+        else:
+            has_tv_numeric = ('tv_match_rate' in emp_rows.columns) and (pd.to_numeric(emp_rows['tv_match_rate'], errors='coerce').dropna().size > 0)
+            if not has_tv_numeric:
+                st.warning("No numeric TV match rate values for this employee. Strengths & Gaps chart cannot be created.")
+                st.write(emp_rows.head(5))
+            else:
+                fig_strengths_gaps = plot_strengths_gaps(emp_rows, selected_employee)
+                st.plotly_chart(fig_strengths_gaps, width='stretch')
     except Exception as e:
         st.error(f"Error creating strengths/gaps chart: {e}")
-        st.write("Sample rows for this employee:", detailed.loc[detailed['employee_id'] == selected_employee].head(5).to_dict(orient='records'))
+        st.write("Sample rows for this employee (post-clean):")
+        st.write(emp_rows.head(5).to_dict(orient='records') if 'emp_rows' in locals() else "No emp_rows available")
 
 # ----------------------------
 # Main
