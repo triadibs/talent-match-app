@@ -537,7 +537,7 @@ def show_results_page():
                 st.exception(e)
 
 def show_analytics_page():
-    """Page with visualizations and analytics - FIXED"""
+    """Page with visualizations and analytics - auto-derive tgv_match_rate if missing"""
     st.markdown("## 📈 Analytics & Insights")
 
     # Get data from session
@@ -545,16 +545,14 @@ def show_analytics_page():
     summary = st.session_state.get('matching_results_summary', None)
     vacancy_id = st.session_state.get('job_vacancy_id', None)
 
-    # If no data, show warning
+    # If no data, show warning (same as you had)
     if detailed is None or (isinstance(detailed, pd.DataFrame) and detailed.empty):
         st.warning("⚠️ No detailed results available. Please create a vacancy or load existing results.")
-        
-        # Allow user to load existing vacancy
         if st.button("🔄 Load Existing Vacancy Results"):
             existing = db.get_recent_vacancies(20)
             if not existing.empty:
                 st.session_state.show_vacancy_selector = True
-        
+
         if st.session_state.get('show_vacancy_selector', False):
             existing = db.get_recent_vacancies(20)
             selected = st.selectbox(
@@ -562,39 +560,45 @@ def show_analytics_page():
                 options=existing['job_vacancy_id'].tolist(),
                 format_func=lambda x: f"ID {x}: {existing[existing['job_vacancy_id']==x]['role_name'].iloc[0]}"
             )
-            
             if st.button("📥 Load Data"):
                 with st.spinner("Loading detailed results..."):
                     try:
                         detailed = db.run_matching_query(int(selected))
-                        
-                        # Normalize columns
-                        if 'final_match_rate' in detailed.columns:
-                            detailed['final_match_rate_percentage'] = detailed['final_match_rate']
-                        
-                        # Ensure numeric
-                        for col in ['tv_match_rate', 'tgv_match_rate', 'final_match_rate_percentage']:
+                        # basic numeric coercion (safe)
+                        for col in ['tv_score','tv_match_rate','tgv_match_rate','final_match_rate','final_match_rate_percentage','baseline_score','user_score']:
                             if col in detailed.columns:
                                 detailed[col] = pd.to_numeric(detailed[col], errors='coerce')
-                                maxv = detailed[col].max(skipna=True)
-                                if pd.notna(maxv) and 0 < maxv <= 1.0:
-                                    detailed[col] = detailed[col] * 100.0
-                        
-                        # Build summary
-                        summary = detailed.groupby('employee_id').agg({
+
+                        # ensure tv_match_rate derived from tv_score if missing
+                        if 'tv_match_rate' not in detailed.columns and 'tv_score' in detailed.columns:
+                            detailed = normalize_match_columns(detailed)  # uses derive_tv_match_rate_from_tv_score
+
+                        # build summary
+                        if 'final_match_rate_percentage' not in detailed.columns and 'final_match_rate' in detailed.columns:
+                            detailed['final_match_rate_percentage'] = detailed['final_match_rate']
+                        tmp = detailed.copy()
+                        if 'final_match_rate_percentage' not in tmp.columns:
+                            for c in ['final_match_rate','tgv_match_rate','tv_match_rate']:
+                                if c in tmp.columns and pd.api.types.is_numeric_dtype(tmp[c]):
+                                    tmp['final_match_rate_percentage'] = tmp[c]
+                                    break
+                        if 'final_match_rate_percentage' in tmp.columns and tmp['final_match_rate_percentage'].max(skipna=True) <= 1.0:
+                            tmp['final_match_rate_percentage'] = tmp['final_match_rate_percentage'] * 100.0
+
+                        summary = tmp.groupby('employee_id').agg({
                             'fullname': 'first',
                             'directorate': 'first',
                             'role': 'first',
                             'grade': 'first',
                             'final_match_rate_percentage': 'first'
                         }).reset_index()
-                        
+
                         st.session_state.matching_results_detailed = detailed
                         st.session_state.matching_results_summary = summary
                         st.session_state.job_vacancy_id = int(selected)
                         st.session_state.vacancy_created = True
                         st.success("✅ Data loaded successfully!")
-                        st.rerun()
+                        st.experimental_rerun()
                     except Exception as e:
                         st.error(f"Error loading data: {e}")
                         st.exception(e)
@@ -605,27 +609,69 @@ def show_analytics_page():
         st.write(f"**Detailed DF shape:** {detailed.shape}")
         st.write(f"**Detailed columns:** {list(detailed.columns)}")
         st.write(f"**Summary DF shape:** {summary.shape if summary is not None else 'None'}")
-        
-        # Check for critical columns
         st.write("**Column checks:**")
-        for col in ['tv_match_rate', 'tgv_match_rate', 'final_match_rate_percentage']:
+        for col in ['tv_score','tv_match_rate','tgv_match_rate','final_match_rate_percentage']:
             if col in detailed.columns:
-                non_null = detailed[col].notna().sum()
-                st.write(f"- {col}: {non_null} non-null values (max: {detailed[col].max():.2f})")
+                non_null = int(detailed[col].notna().sum())
+                mn = detailed[col].min(skipna=True)
+                mx = detailed[col].max(skipna=True)
+                st.write(f"- {col}: {non_null} non-null values (min/max: {mn}/{mx})")
             else:
                 st.write(f"- {col}: ❌ MISSING")
-        
         st.write("**Sample data (first 3 rows):**")
         st.dataframe(detailed.head(3))
 
-    # Normalize columns
-    if 'final_match_rate' in detailed.columns and 'final_match_rate_percentage' not in detailed.columns:
-        detailed['final_match_rate_percentage'] = detailed['final_match_rate']
-    
-    # Ensure numeric
-    for col in ['tv_match_rate', 'tgv_match_rate', 'final_match_rate_percentage']:
+    # Ensure numeric for relevant cols
+    for col in ['tv_score','tv_match_rate','tgv_match_rate','final_match_rate','final_match_rate_percentage','baseline_score','user_score']:
         if col in detailed.columns:
             detailed[col] = pd.to_numeric(detailed[col], errors='coerce')
+
+    # If tv_match_rate is missing but tv_score exists, derive (min-max per tv_name)
+    if ('tv_match_rate' not in detailed.columns or detailed['tv_match_rate'].isna().all()) and 'tv_score' in detailed.columns:
+        detailed = normalize_match_columns(detailed)  # derive_tv_match_rate_from_tv_score applied here
+
+    # Now derive tgv_match_rate per (employee_id, tgv_name) if missing or all-NaN
+    need_derive_tgv = ('tgv_match_rate' not in detailed.columns) or (detailed['tgv_match_rate'].isna().all())
+    if need_derive_tgv:
+        st.info("ℹ️ Deriving `tgv_match_rate` from available TV-level scores (aggregation).")
+        # compute agg per employee & tgv
+        # prefer max (most representative) but fallback to mean if you prefer mean -> change aggfunc
+        agg = (detailed
+               .dropna(subset=['tv_match_rate'])
+               .groupby(['employee_id','tgv_name'], as_index=False)['tv_match_rate']
+               .agg(['max','mean'])
+               .reset_index())
+        if not agg.empty:
+            # choose value: if max exists use max, else mean
+            agg['tgv_match_rate_derived'] = agg['max'].combine_first(agg['mean'])
+            # keep only needed cols and merge back
+            to_merge = agg[['employee_id','tgv_name','tgv_match_rate_derived']].rename(columns={'tgv_match_rate_derived':'tgv_match_rate'})
+            # merge into detailed: many TV rows per employee/tgv; we add tgv_match_rate column
+            detailed = detailed.merge(to_merge, on=['employee_id','tgv_name'], how='left', suffixes=('','_derived_temp'))
+            # if original tgv_match_rate exists, prefer it; else fill with derived
+            if 'tgv_match_rate' in detailed.columns and detailed['tgv_match_rate'].notna().any():
+                # some libs may have created both columns; unify
+                detailed['tgv_match_rate'] = detailed['tgv_match_rate'].fillna(detailed.get('tgv_match_rate_derived'))
+            else:
+                # if original missing entirely, rename derived
+                if 'tgv_match_rate' not in detailed.columns:
+                    detailed = detailed.rename(columns={'tgv_match_rate_derived':'tgv_match_rate'})
+            # drop helper if present
+            if 'tgv_match_rate_derived' in detailed.columns:
+                # already handled; ensure column named tgv_match_rate exists
+                if 'tgv_match_rate' not in detailed.columns:
+                    detailed = detailed.rename(columns={'tgv_match_rate_derived':'tgv_match_rate'})
+                else:
+                    detailed = detailed.drop(columns=['tgv_match_rate_derived'])
+        else:
+            st.warning("⚠️ Could not derive tgv_match_rate because no tv_match_rate values are available to aggregate.")
+
+    # ensure numeric and clipped
+    if 'tgv_match_rate' in detailed.columns:
+        detailed['tgv_match_rate'] = pd.to_numeric(detailed['tgv_match_rate'], errors='coerce').clip(lower=0.0, upper=100.0)
+
+    # Update session state (persist derivation)
+    st.session_state.matching_results_detailed = detailed
 
     # Build/update summary if needed
     if summary is None or summary.empty:
@@ -644,31 +690,25 @@ def show_analytics_page():
         st.error("❌ No valid match scores found in data")
         return
 
-    # KEY INSIGHTS
+    # KEY INSIGHTS (unchanged)
     st.markdown("### 🔍 Key Insights")
     col1, col2, col3, col4 = st.columns(4)
-
     with col1:
         avg_match = summary['final_match_rate_percentage'].mean()
         st.metric("Avg Match Rate", f"{avg_match:.1f}%")
-
     with col2:
         top_match = summary['final_match_rate_percentage'].max()
         st.metric("Top Match", f"{top_match:.1f}%")
-
     with col3:
         candidates_above_70 = (summary['final_match_rate_percentage'] >= 70).sum()
         st.metric("Matches ≥70%", candidates_above_70)
-
     with col4:
         candidates_above_80 = (summary['final_match_rate_percentage'] >= 80).sum()
         st.metric("Matches ≥80%", candidates_above_80)
 
     st.markdown("---")
-
-    # VISUALIZATIONS
+    # VISUALIZATIONS (unchanged)
     col1, col2 = st.columns(2)
-
     with col1:
         st.markdown("#### 📊 Match Score Distribution")
         try:
@@ -676,7 +716,6 @@ def show_analytics_page():
             st.plotly_chart(fig_dist, use_container_width=True)
         except Exception as e:
             st.error(f"Error creating distribution chart: {e}")
-
     with col2:
         st.markdown("#### 🏆 Top 10 Candidates")
         try:
@@ -686,35 +725,24 @@ def show_analytics_page():
             st.error(f"Error creating top candidates chart: {e}")
 
     st.markdown("---")
-
-    # TGV ANALYSIS
+    # TGV ANALYSIS (now safe)
     st.markdown("### 📊 TGV-Level Analysis")
 
-    # Check if we have TGV data
     if 'tgv_match_rate' not in detailed.columns:
-        st.error("❌ Column 'tgv_match_rate' not found in detailed results")
-        return
-    
-    if detailed['tgv_match_rate'].isna().all():
-        st.error("❌ All tgv_match_rate values are NULL")
+        st.error("❌ Column 'tgv_match_rate' not found in detailed results even after derivation")
         return
 
-    # Build employee selection list
+    if detailed['tgv_match_rate'].isna().all():
+        st.error("❌ All tgv_match_rate values are NULL (no tv_match_rate available to aggregate)")
+        return
+
+    # Build employee selection list (avg tgv per employee)
     try:
-        tgv_summary = detailed[['employee_id', 'fullname', 'tgv_match_rate']].copy()
-        tgv_summary = tgv_summary.groupby(['employee_id', 'fullname']).agg({
-            'tgv_match_rate': 'mean'
-        }).reset_index()
-        
+        tgv_summary = detailed[['employee_id', 'fullname', 'tgv_name', 'tgv_match_rate']].copy()
+        tgv_summary = tgv_summary.groupby(['employee_id','fullname'], as_index=False).agg({'tgv_match_rate':'mean'})
         if 'final_match_rate_percentage' in summary.columns:
-            tgv_summary = tgv_summary.merge(
-                summary[['employee_id', 'final_match_rate_percentage']], 
-                on='employee_id', 
-                how='left'
-            )
-        
+            tgv_summary = tgv_summary.merge(summary[['employee_id','final_match_rate_percentage']], on='employee_id', how='left')
         tgv_summary = tgv_summary.sort_values('final_match_rate_percentage', ascending=False).head(200)
-        
     except Exception as e:
         st.error(f"Cannot prepare employee list: {e}")
         return
@@ -724,7 +752,6 @@ def show_analytics_page():
         return
 
     employee_options = tgv_summary['employee_id'].tolist()
-    
     selected_employee = st.selectbox(
         "Select Employee for TGV Profile:",
         options=employee_options,
@@ -732,15 +759,14 @@ def show_analytics_page():
     )
 
     # Show selected employee's data summary
-    emp_data = detailed[detailed['employee_id'] == selected_employee]
+    emp_data = detailed[detailed['employee_id'].astype(str).str.strip() == str(selected_employee).strip()]
     with st.expander(f"📋 Data Summary for Employee {selected_employee}"):
         st.write(f"**Total TV records:** {len(emp_data)}")
-        st.write(f"**Unique TGVs:** {emp_data['tgv_name'].nunique()}")
-        st.write(f"**TV match rate - non-null:** {emp_data['tv_match_rate'].notna().sum()}")
+        st.write(f"**Unique TGVs:** {emp_data['tgv_name'].nunique() if 'tgv_name' in emp_data.columns else 0}")
+        st.write(f"**TV match rate - non-null:** {emp_data['tv_match_rate'].notna().sum() if 'tv_match_rate' in emp_data.columns else 0}")
         st.write(f"**TGV match rate - non-null:** {emp_data['tgv_match_rate'].notna().sum()}")
 
     col1, col2 = st.columns(2)
-
     with col1:
         st.markdown("#### 🎯 TGV Radar Profile")
         try:
@@ -749,7 +775,6 @@ def show_analytics_page():
         except Exception as e:
             st.error(f"Error creating radar chart: {e}")
             st.exception(e)
-
     with col2:
         st.markdown("#### 🔥 TV Heatmap (Top TGVs)")
         try:
@@ -760,8 +785,6 @@ def show_analytics_page():
             st.exception(e)
 
     st.markdown("---")
-
-    # STRENGTHS & GAPS
     st.markdown("### ✅ Strengths & Gaps Analysis")
     try:
         fig_strengths_gaps = plot_strengths_gaps(detailed, selected_employee)
