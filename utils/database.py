@@ -528,3 +528,225 @@ class DatabaseManager:
         query = "SELECT * FROM talent_benchmarks WHERE job_vacancy_id = %s"
         result = self.execute_query(query, params=(job_vacancy_id,))
         return result.iloc[0].to_dict() if not result.empty else {}
+
+    # Tambahkan method ini ke class DatabaseManager di database.py
+
+    def diagnose_matching_pipeline(self, job_vacancy_id: int) -> Dict[str, pd.DataFrame]:
+        """
+        Diagnostic queries to check each stage of the matching pipeline
+        Returns dict of DataFrames showing data at each stage
+        """
+        diagnostics = {}
+        
+        # 1. Check if vacancy exists
+        diagnostics['vacancy'] = self.execute_query(
+            "SELECT * FROM talent_benchmarks WHERE job_vacancy_id = %s",
+            params=(job_vacancy_id,)
+        )
+        
+        # 2. Check selected talents
+        diagnostics['selected_talents'] = self.execute_query(
+            """
+            SELECT job_vacancy_id, 
+                   unnest(selected_talent_ids) AS employee_id
+            FROM talent_benchmarks
+            WHERE job_vacancy_id = %s
+            """,
+            params=(job_vacancy_id,)
+        )
+        
+        # 3. Check if tb_tv_scores_long has data
+        diagnostics['tv_scores_count'] = self.execute_query(
+            """
+            SELECT 
+                tgv_name,
+                tv_name,
+                COUNT(*) as employee_count,
+                COUNT(DISTINCT employee_id) as unique_employees,
+                MIN(tv_score) as min_score,
+                MAX(tv_score) as max_score,
+                AVG(tv_score) as avg_score
+            FROM tb_tv_scores_long
+            GROUP BY tgv_name, tv_name
+            ORDER BY tgv_name, tv_name
+            """
+        )
+        
+        # 4. Check baseline calculation
+        diagnostics['baseline_check'] = self.execute_query(
+            """
+            SELECT 
+                b.tgv_name,
+                b.tv_name,
+                b.baseline_mean,
+                b.baseline_stddev,
+                b.benchmark_count
+            FROM tb_baseline_per_tv b
+            WHERE b.job_vacancy_id = %s
+            ORDER BY b.tgv_name, b.tv_name
+            """,
+            params=(job_vacancy_id,)
+        )
+        
+        # 5. Check employees_with_tv
+        diagnostics['employees_with_tv_count'] = self.execute_query(
+            """
+            SELECT 
+                COUNT(*) as total_rows,
+                COUNT(DISTINCT employee_id) as unique_employees,
+                COUNT(DISTINCT tgv_name) as unique_tgv,
+                COUNT(DISTINCT tv_name) as unique_tv,
+                COUNT(*) FILTER (WHERE baseline_mean IS NOT NULL) as rows_with_baseline,
+                COUNT(*) FILTER (WHERE user_score IS NOT NULL) as rows_with_score
+            FROM tb_employees_with_tv
+            WHERE job_vacancy_id = %s
+            """,
+            params=(job_vacancy_id,)
+        )
+        
+        # 6. Check tv_match_calc results
+        diagnostics['tv_match_calc_sample'] = self.execute_query(
+            """
+            SELECT 
+                employee_id,
+                fullname,
+                tgv_name,
+                tv_name,
+                user_score,
+                baseline_mean,
+                baseline_stddev,
+                tv_match_rate
+            FROM tb_tv_match_calc
+            WHERE job_vacancy_id = %s
+            AND tv_match_rate IS NOT NULL
+            LIMIT 20
+            """,
+            params=(job_vacancy_id,)
+        )
+        
+        # 7. Check if any NULL tv_match_rates
+        diagnostics['null_match_rates'] = self.execute_query(
+            """
+            SELECT 
+                COUNT(*) as total_rows,
+                COUNT(*) FILTER (WHERE tv_match_rate IS NULL) as null_match_rates,
+                COUNT(*) FILTER (WHERE tv_match_rate IS NOT NULL) as valid_match_rates,
+                COUNT(*) FILTER (WHERE baseline_mean IS NULL) as null_baseline,
+                COUNT(*) FILTER (WHERE user_score IS NULL) as null_user_score
+            FROM tb_tv_match_calc
+            WHERE job_vacancy_id = %s
+            """,
+            params=(job_vacancy_id,)
+        )
+        
+        # 8. Check final aggregation
+        diagnostics['final_aggregation'] = self.execute_query(
+            """
+            SELECT 
+                COUNT(*) as total_employees,
+                COUNT(*) FILTER (WHERE final_match_rate IS NOT NULL) as with_match_rate,
+                AVG(final_match_rate) as avg_match_rate,
+                MIN(final_match_rate) as min_match_rate,
+                MAX(final_match_rate) as max_match_rate
+            FROM tb_final_aggregation
+            """
+        )
+        
+        # 9. Check raw profiles_psych data
+        diagnostics['profiles_psych_sample'] = self.execute_query(
+            """
+            SELECT 
+                employee_id,
+                iq,
+                gtq,
+                faxtor,
+                pauli,
+                tiki,
+                disc,
+                mbti
+            FROM profiles_psych
+            LIMIT 10
+            """
+        )
+        
+        # 10. Check raw competencies data
+        diagnostics['competencies_sample'] = self.execute_query(
+            """
+            SELECT 
+                employee_id,
+                pillar_code,
+                score,
+                year
+            FROM competencies_yearly
+            WHERE year = (SELECT MAX(year) FROM competencies_yearly)
+            LIMIT 10
+            """
+        )
+        
+        return diagnostics
+    
+    
+    # Tambahkan juga method untuk check data quality
+    def check_data_quality(self) -> Dict[str, pd.DataFrame]:
+        """
+        Check data quality across source tables
+        """
+        quality_checks = {}
+        
+        # Check profiles_psych
+        quality_checks['profiles_psych'] = self.execute_query(
+            """
+            SELECT 
+                COUNT(*) as total_employees,
+                COUNT(iq) as has_iq,
+                COUNT(gtq) as has_gtq,
+                COUNT(faxtor) as has_faxtor,
+                COUNT(pauli) as has_pauli,
+                COUNT(tiki) as has_tiki,
+                COUNT(disc) as has_disc,
+                COUNT(mbti) as has_mbti
+            FROM profiles_psych
+            """
+        )
+        
+        # Check competencies_yearly
+        quality_checks['competencies'] = self.execute_query(
+            """
+            SELECT 
+                year,
+                COUNT(*) as total_records,
+                COUNT(DISTINCT employee_id) as unique_employees,
+                COUNT(DISTINCT pillar_code) as unique_pillars,
+                AVG(score::numeric) as avg_score
+            FROM competencies_yearly
+            GROUP BY year
+            ORDER BY year DESC
+            """
+        )
+        
+        # Check papi_scores
+        quality_checks['papi_scores'] = self.execute_query(
+            """
+            SELECT 
+                COUNT(*) as total_records,
+                COUNT(DISTINCT employee_id) as unique_employees,
+                COUNT(DISTINCT scale_code) as unique_scales,
+                AVG(score) as avg_score
+            FROM papi_scores
+            """
+        )
+        
+        # Check employees
+        quality_checks['employees'] = self.execute_query(
+            """
+            SELECT 
+                COUNT(*) as total_employees,
+                COUNT(years_of_service_months) as has_service_months,
+                COUNT(company_id) as has_company,
+                COUNT(position_id) as has_position,
+                COUNT(grade_id) as has_grade
+            FROM employees
+            """
+        )
+        
+        return quality_checks
