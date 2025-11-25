@@ -285,21 +285,39 @@ class DatabaseManager:
                     # 6. Baseline per TV (PATCHED: join using mapped_employee_id)
                     cur.execute(r"""
                         CREATE TABLE tb_baseline_per_tv AS
-                        WITH st_map AS (
-                          SELECT job_vacancy_id,
-                                 selected_id_raw,
-                                 COALESCE(mapped_employee_id, selected_id_raw) AS mapped_employee_id
-                          FROM tb_selected_talents
-                        )
-                        SELECT st.job_vacancy_id, tv.tgv_name, tv.tv_name, tv.scoring_direction,
-                               AVG(tv.tv_score) AS baseline_mean,
-                               STDDEV_POP(tv.tv_score) AS baseline_stddev,
-                               COUNT(DISTINCT tv.employee_id) AS benchmark_count
-                        FROM st_map st
+                    WITH raw_base AS (
+                        SELECT
+                          st.job_vacancy_id,
+                          tv.tgv_name,
+                          tv.tv_name,
+                          tv.scoring_direction,
+                          tv.tv_score
+                        FROM tb_selected_talents st
                         JOIN tb_tv_scores_long tv
-                          ON tv.employee_id = st.mapped_employee_id
-                        GROUP BY st.job_vacancy_id, tv.tgv_name, tv.tv_name, tv.scoring_direction
-                    """)
+                          ON tv.employee_id = st.employee_id
+                    )
+                    SELECT
+                        job_vacancy_id,
+                        tgv_name,
+                        tv_name,
+                        scoring_direction,
+                    
+                        -- baseline_mean fallback: use AVG, if NULL fallback to median, else fallback 0
+                        CASE
+                            WHEN AVG(tv_score) IS NOT NULL THEN AVG(tv_score)
+                            WHEN PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY tv_score) IS NOT NULL
+                                THEN PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY tv_score)
+                            ELSE 0
+                        END AS baseline_mean,
+                    
+                        -- stddev fallback: if all values same or no data → set 0
+                        COALESCE(STDDEV_POP(tv_score), 0) AS baseline_stddev,
+                    
+                        COUNT(*) AS benchmark_count
+                    
+                    FROM raw_base
+                    GROUP BY job_vacancy_id, tgv_name, tv_name, scoring_direction;
+
 
                     # 7. Employees with TV
                     cur.execute("""
