@@ -221,7 +221,7 @@ class DatabaseManager:
                     cur.execute("""
                         CREATE TABLE tb_profiles_psych_norm AS
                         SELECT employee_id, iq, gtq, faxtor, pauli, tiki
-                        FROM profiles_psych
+                        FROM tb_profiles_psych_norm
                     """)
 
                     # 5. TV scores long
@@ -336,7 +336,7 @@ class DatabaseManager:
                         LEFT JOIN dim_positions pos ON e.position_id = pos.position_id
                         LEFT JOIN dim_grades gr ON e.grade_id = gr.grade_id
                         CROSS JOIN tb_vacancy v
-                        LEFT JOIN tb_tv_scores_long tv ON tv.employee_id = e.employee_id
+                        LEFT JOIN tb_tv_scores_long tv ON tv.employee_id = st.mapped_employee_id
                         LEFT JOIN tb_baseline_per_tv b
                           ON b.job_vacancy_id = v.job_vacancy_id
                           AND b.tgv_name = tv.tgv_name
