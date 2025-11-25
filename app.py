@@ -477,6 +477,28 @@ def show_results_page():
             except Exception as e:
                 st.exception(e)
 
+    # === DEBUG block for results page: show dtypes & head when available ===
+    with st.expander("🔧 DEBUG: loaded 'detailed' info (results page)", expanded=False):
+        try:
+            d = st.session_state.get('matching_results_detailed', None)
+            if d is None:
+                st.write("session_state.matching_results_detailed is None")
+            else:
+                st.write("### dtypes")
+                st.code(d.dtypes.to_dict())
+                st.write("### first 10 rows (head)")
+                st.dataframe(d.head(10), use_container_width=True)
+
+                st.write("### quick match-rate summary")
+                for col in ['final_match_rate_percentage', 'tgv_match_rate', 'tv_match_rate', 'tv_score']:
+                    if col in d.columns:
+                        s = pd.to_numeric(d[col], errors='coerce')
+                        st.write(f"**{col}** — dtype: {d[col].dtype} | non-null: {s.count()} | min/max: {s.min(skipna=True)}/{s.max(skipna=True)}")
+                    else:
+                        st.write(f"**{col}** — MISSING")
+        except Exception as _e:
+            st.write("DEBUG error:", _e)
+
 def show_analytics_page():
     st.markdown("## 📈 Analytics & Insights")
     detailed = st.session_state.get('matching_results_detailed', None)
@@ -572,6 +594,39 @@ def show_analytics_page():
 
     selected_employee = st.selectbox("Select Employee for TGV Profile:", options=employee_options, format_func=_format_emp)
 
+    # === DEBUG expander for analytics page ===
+    with st.expander("🔧 DEBUG: detailed dataframe info", expanded=False):
+        try:
+            d = st.session_state.get('matching_results_detailed', None)
+            if d is None:
+                st.write("session_state.matching_results_detailed is None")
+            else:
+                # allow user to enter an employee id to inspect
+                debug_emp = st.text_input("DEBUG: employee_id to inspect", value=st.session_state.get('debug_selected_employee', ''))
+                st.session_state['debug_selected_employee'] = debug_emp
+
+                st.write("### dtypes")
+                st.code(d.dtypes.to_dict())
+                st.write("### first 10 rows (head)")
+                st.dataframe(d.head(10), use_container_width=True)
+
+                st.write("### quick match-rate summary")
+                for col in ['final_match_rate_percentage', 'tgv_match_rate', 'tv_match_rate', 'tv_score']:
+                    if col in d.columns:
+                        s = pd.to_numeric(d[col], errors='coerce')
+                        st.write(f"**{col}** — dtype: {d[col].dtype} | non-null: {s.count()} | min/max: {s.min(skipna=True)}/{s.max(skipna=True)}")
+                    else:
+                        st.write(f"**{col}** — MISSING")
+
+                sel_emp = st.session_state.get('debug_selected_employee', None)
+                if sel_emp:
+                    mask = d['employee_id'].astype(str).str.strip() == str(sel_emp).strip()
+                    st.write(f"### Rows for employee_id = {sel_emp} ({mask.sum()} rows)")
+                    if mask.any():
+                        st.dataframe(d[mask].head(50), use_container_width=True)
+        except Exception as _e:
+            st.write("DEBUG error:", _e)
+
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("#### 🎯 TGV Radar Profile")
@@ -623,3 +678,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
