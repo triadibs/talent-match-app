@@ -17,36 +17,40 @@ from typing import List, Optional
 def _to_numeric_percent(series: pd.Series) -> pd.Series:
     """
     Convert a Series that may contain numeric-like strings or percent-strings into floats on 0..100 scale.
-    Rules:
-      - strip whitespace
-      - remove trailing '%' if present
-      - replace comma decimal separators if needed
-      - coerce to numeric, errors -> NaN
-      - if numeric max <= 1.0 -> assume 0..1 scale and multiply by 100
-    Returns new Series (float, may contain NaN).
+    Safe: does not use Series.str accessor (avoids dtype errors).
     """
     if series is None:
         return pd.Series(dtype=float)
 
-    # Convert to string but preserve NaN-like as real NaN
+    # Work on a copy and preserve true NaN
     s = series.copy()
-    # preserve original NaN
-    s = s.astype(object).where(~s.isna(), other=np.nan)
-    # turn non-nulls to str then strip
-    s = s.apply(lambda x: str(x).strip() if pd.notna(x) else np.nan)
+    s = s.where(~s.isna(), other=np.nan)
 
-    # handle some explicit representations
-    s = pd.Series(s).replace({'': np.nan, 'nan': np.nan, 'None': np.nan})
+    # Convert each non-null value to stripped string representation safely
+    def _norm_val(x):
+        if pd.isna(x):
+            return np.nan
+        try:
+            txt = str(x).strip()
+        except Exception:
+            return np.nan
+        if txt == "" or txt.lower() in ("nan", "none"):
+            return np.nan
+        # remove percent sign and normalize comma decimal separators
+        txt = txt.replace("%", "")
+        txt = txt.replace(",", ".")
+        return txt
 
-    # remove percent and normalise decimal separator
-    s = s.str.replace('%', '', regex=False)
-    s = s.str.replace(',', '.', regex=False)
+    s = s.map(_norm_val)
 
+    # Now coerce to numeric
     coerced = pd.to_numeric(s, errors='coerce')
 
+    # If no numeric values found, return float series (may be all NaN)
     if coerced.dropna().empty:
         return coerced.astype(float)
 
+    # If values appear to be 0..1 scale, convert to 0..100
     maxv = coerced.max(skipna=True)
     if pd.notna(maxv) and maxv <= 1.0:
         coerced = coerced * 100.0
