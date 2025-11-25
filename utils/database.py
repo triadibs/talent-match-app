@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 """
 Database Manager for Talent Match System
-Using psycopg3 with Supabase Pooler
+FIXED: Ensures tgv_match_rate and tv_match_rate are properly returned
 """
 
 import psycopg
@@ -39,17 +40,12 @@ class DatabaseManager:
 
     def get_connection(self):
         """Return psycopg3 connection"""
-        # row_factory=dict_row returns dict-like rows which pandas can consume
         return psycopg.connect(**self.conn_params, row_factory=dict_row)
 
-    # ---------------------------------------------
-    # GENERIC QUERY FUNCTION
-    # ---------------------------------------------
     def execute_query(self, query: str, params: tuple = None, fetch: bool = True) -> pd.DataFrame:
         """Execute SQL query and return results (returns empty DataFrame if no rows)."""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
-                # Handle params None explicitly to avoid passing None to execute
                 if params:
                     cur.execute(query, params)
                 else:
@@ -62,9 +58,7 @@ class DatabaseManager:
                     conn.commit()
                     return pd.DataFrame()
 
-    # ---------------------------------------------
     # HOME PAGE QUERIES
-    # ---------------------------------------------
     def get_total_employees(self) -> int:
         query = "SELECT COUNT(*) as count FROM employees"
         result = self.execute_query(query)
@@ -74,7 +68,7 @@ class DatabaseManager:
         query = """
         SELECT COUNT(DISTINCT employee_id) as count
         FROM performance_yearly
-        WHERE rating = 5 
+        WHERE rating = 5
         AND year = (SELECT MAX(year) FROM performance_yearly)
         """
         result = self.execute_query(query)
@@ -98,12 +92,8 @@ class DatabaseManager:
         ORDER BY created_at DESC
         LIMIT %s
         """
-        # parameterize limit
         return self.execute_query(query, params=(limit,))
 
-    # ---------------------------------------------
-    # HIGH PERFORMER LIST
-    # ---------------------------------------------
     def get_high_performers(self) -> pd.DataFrame:
         query = """
         SELECT DISTINCT
@@ -123,9 +113,6 @@ class DatabaseManager:
         """
         return self.execute_query(query)
 
-    # ---------------------------------------------
-    # INSERT VACANCY 
-    # ---------------------------------------------
     def insert_vacancy(
         self,
         role_name: str,
@@ -135,7 +122,6 @@ class DatabaseManager:
         weights_config: Optional[Dict] = None,
     ) -> int:
         """Insert vacancy using psycopg3 Jsonb"""
-
         query = """
         INSERT INTO talent_benchmarks
         (role_name, job_level, role_purpose, selected_talent_ids, weights_config)
@@ -161,25 +147,16 @@ class DatabaseManager:
                 conn.commit()
                 return row["job_vacancy_id"]
 
-    # ---------------------------------------------
-    # RUN MATCHING PIPELINE (revised: z-score + logistic)
-    # ---------------------------------------------
     def run_matching_query(self, job_vacancy_id: int) -> pd.DataFrame:
         """
-        Revised matching pipeline:
-        - compute baseline mean & stddev per TV using selected benchmarks
-        - compute z-score per employee per TV: (user_score - baseline_mean) / NULLIF(baseline_stddev,0)
-        - transform via logistic to 0..100: 100 * (1 / (1 + exp(-z)))
-        - fallback to ratio method when stddev is NULL/0 or baseline_mean is NULL
-        - aggregate TGV (weighted), then final aggregation
-        Returns detailed per-TV rows joined with tgv/tgv_match_rate/final_match_rate
+        FIXED: Complete matching pipeline that ensures all columns are present
+        Returns detailed per-TV rows with tgv_match_rate and tv_match_rate
         """
         with self.get_connection() as conn:
             try:
                 with conn.cursor() as cur:
-                    # ===== 1) DROP OLD TABLES =====
-                    cur.execute(
-                        """
+                    # Drop old tables
+                    cur.execute("""
                         DROP TABLE IF EXISTS tb_vacancy CASCADE;
                         DROP TABLE IF EXISTS tb_latest_year CASCADE;
                         DROP TABLE IF EXISTS tb_selected_talents CASCADE;
@@ -192,71 +169,54 @@ class DatabaseManager:
                         DROP TABLE IF EXISTS tb_tgv_aggregation CASCADE;
                         DROP TABLE IF EXISTS tb_tgv_with_weights CASCADE;
                         DROP TABLE IF EXISTS tb_final_aggregation CASCADE;
-                        """
-                    )
+                    """)
 
-                    # ===== 2) CREATE VACANCY TABLE =====
-                    cur.execute(
-                        """
+                    # 1. Vacancy
+                    cur.execute("""
                         CREATE TABLE tb_vacancy AS
-                        SELECT job_vacancy_id, role_name, job_level, role_purpose, selected_talent_ids, weights_config
+                        SELECT job_vacancy_id, role_name, job_level, role_purpose, 
+                               selected_talent_ids, weights_config
                         FROM talent_benchmarks
                         WHERE job_vacancy_id = %s
-                        """,
-                        (job_vacancy_id,)
-                    )
+                    """, (job_vacancy_id,))
 
-                    # ===== 3) LATEST YEAR =====
-                    cur.execute(
-                        """
+                    # 2. Latest year
+                    cur.execute("""
                         CREATE TABLE tb_latest_year AS
                         SELECT MAX(year) AS max_year
                         FROM competencies_yearly
-                        """
-                    )
+                    """)
 
-                    # ===== 4) SELECTED TALENTS =====
-                    cur.execute(
-                        """
+                    # 3. Selected talents
+                    cur.execute("""
                         CREATE TABLE tb_selected_talents AS
                         SELECT v.job_vacancy_id,
                                unnest(v.selected_talent_ids) AS employee_id,
                                v.weights_config
                         FROM tb_vacancy v
-                        """
-                    )
+                    """)
 
-                    # ===== 5) PROFILES PSYCH NORM =====
-                    cur.execute(
-                        """
+                    # 4. Profiles psych norm
+                    cur.execute("""
                         CREATE TABLE tb_profiles_psych_norm AS
-                        SELECT
-                          employee_id,
-                          iq,
-                          gtq,
-                          faxtor, pauli, tiki
+                        SELECT employee_id, iq, gtq, faxtor, pauli, tiki
                         FROM profiles_psych
-                        """
-                    )
+                    """)
 
-                    # ===== 6) TV SCORES LONG (COMPLETE UNION ALL) =====
-                    cur.execute(
-                        r"""
+                    # 5. TV scores long
+                    cur.execute(r"""
                         CREATE TABLE tb_tv_scores_long AS
-                        SELECT employee_id,
-                               'cognitive_ability'::text AS tgv_name,
-                               'iq'::text AS tv_name,
-                               (iq::text)::numeric AS tv_score,
+                        SELECT employee_id, 'cognitive_ability'::text AS tgv_name,
+                               'iq'::text AS tv_name, (iq::text)::numeric AS tv_score,
                                'higher_better'::text AS scoring_direction
                         FROM tb_profiles_psych_norm
-                        WHERE iq IS NOT NULL
-                          AND trim(coalesce(iq::text,'')) <> ''
+                        WHERE iq IS NOT NULL AND trim(coalesce(iq::text,'')) <> ''
                           AND (iq::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
 
                         UNION ALL
                         SELECT employee_id, 'cognitive_ability', 'gtq', (gtq::text)::numeric, 'higher_better'
                         FROM tb_profiles_psych_norm
-                        WHERE gtq IS NOT NULL AND trim(coalesce(gtq::text,'')) <> '' 
+                        WHERE gtq IS NOT NULL AND trim(coalesce(gtq::text,'')) <> ''
                           AND (gtq::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
 
                         UNION ALL
@@ -278,14 +238,15 @@ class DatabaseManager:
                           AND (tiki::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
 
                         UNION ALL
-                        SELECT c.employee_id, 'leadership_competencies', c.pillar_code::text AS tv_name, (c.score::text)::numeric, 'higher_better'
+                        SELECT c.employee_id, 'leadership_competencies', c.pillar_code::text, 
+                               (c.score::text)::numeric, 'higher_better'
                         FROM competencies_yearly c, tb_latest_year ly
-                        WHERE c.year = ly.max_year
-                          AND c.score IS NOT NULL AND trim(coalesce(c.score::text,'')) <> ''
+                        WHERE c.year = ly.max_year AND c.score IS NOT NULL 
+                          AND trim(coalesce(c.score::text,'')) <> ''
                           AND (c.score::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
 
                         UNION ALL
-                        SELECT ps.employee_id, 'work_preferences', ('papi_' || lower(ps.scale_code))::text AS tv_name,
+                        SELECT ps.employee_id, 'work_preferences', ('papi_' || lower(ps.scale_code))::text,
                                (ps.score::text)::numeric,
                                CASE WHEN ps.scale_code IN ('Z','K') THEN 'lower_better' ELSE 'higher_better' END
                         FROM papi_scores ps
@@ -299,45 +260,31 @@ class DatabaseManager:
                         WHERE e.years_of_service_months IS NOT NULL
                           AND trim(coalesce(e.years_of_service_months::text, '')) <> ''
                           AND (e.years_of_service_months::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
-                        """
-                    )
+                    """)
 
-                    # ===== 7) BASELINE PER TV (mean & stddev from selected benchmarks) =====
-                    cur.execute(
-                        """
+                    # 6. Baseline per TV
+                    cur.execute("""
                         CREATE TABLE tb_baseline_per_tv AS
-                        SELECT
-                          st.job_vacancy_id,
-                          tv.tgv_name,
-                          tv.tv_name,
-                          tv.scoring_direction,
-                          AVG(tv.tv_score) AS baseline_mean,
-                          STDDEV_POP(tv.tv_score) AS baseline_stddev,
-                          COUNT(DISTINCT tv.employee_id) AS benchmark_count
+                        SELECT st.job_vacancy_id, tv.tgv_name, tv.tv_name, tv.scoring_direction,
+                               AVG(tv.tv_score) AS baseline_mean,
+                               STDDEV_POP(tv.tv_score) AS baseline_stddev,
+                               COUNT(DISTINCT tv.employee_id) AS benchmark_count
                         FROM tb_selected_talents st
                         JOIN tb_tv_scores_long tv ON tv.employee_id = st.employee_id
                         GROUP BY st.job_vacancy_id, tv.tgv_name, tv.tv_name, tv.scoring_direction
-                        """
-                    )
+                    """)
 
-                    # ===== 8) EMPLOYEES WITH TV =====
-                    cur.execute(
-                        """
+                    # 7. Employees with TV
+                    cur.execute("""
                         CREATE TABLE tb_employees_with_tv AS
-                        SELECT
-                          e.employee_id,
-                          e.fullname,
-                          dir.name AS directorate,
-                          pos.name AS role,
-                          gr.name AS grade,
-                          tv.tgv_name,
-                          tv.tv_name,
-                          tv.tv_score AS user_score,
-                          tv.scoring_direction,
-                          b.baseline_mean,
-                          b.baseline_stddev,
-                          v.weights_config,
-                          v.job_vacancy_id
+                        SELECT e.employee_id, e.fullname,
+                               dir.name AS directorate,
+                               pos.name AS role,
+                               gr.name AS grade,
+                               tv.tgv_name, tv.tv_name, tv.tv_score AS user_score,
+                               tv.scoring_direction,
+                               b.baseline_mean, b.baseline_stddev,
+                               v.weights_config, v.job_vacancy_id
                         FROM employees e
                         LEFT JOIN dim_directorates dir ON e.directorate_id = dir.directorate_id
                         LEFT JOIN dim_positions pos ON e.position_id = pos.position_id
@@ -349,23 +296,18 @@ class DatabaseManager:
                           AND b.tgv_name = tv.tgv_name
                           AND b.tv_name = tv.tv_name
                         WHERE tv.tv_score IS NOT NULL
-                        """
-                    )
+                    """)
 
-                    # ===== 9) TV MATCH CALC (z-score logistic, fallback to ratio) =====
-                    cur.execute(
-                        """
+                    # 8. TV match calc
+                    cur.execute("""
                         CREATE TABLE tb_tv_match_calc AS
-                        SELECT
-                          e.*,
+                        SELECT e.*,
                           CASE
                             WHEN e.baseline_mean IS NULL THEN NULL
                             WHEN e.scoring_direction = 'boolean' THEN
                               CASE WHEN e.user_score = e.baseline_mean THEN 100.0 ELSE 0.0 END
                             WHEN e.baseline_stddev IS NOT NULL AND e.baseline_stddev <> 0 THEN
-                              (
-                                100.0 * (1.0 / (1.0 + exp( - ( (e.user_score - e.baseline_mean) / NULLIF(e.baseline_stddev, 0) ) ) ))
-                              )
+                              (100.0 * (1.0 / (1.0 + exp(-(e.user_score - e.baseline_mean) / NULLIF(e.baseline_stddev, 0)))))
                             WHEN e.baseline_mean IS NOT NULL AND (e.baseline_stddev IS NULL OR e.baseline_stddev = 0) THEN
                               CASE
                                 WHEN e.scoring_direction = 'lower_better' THEN
@@ -377,19 +319,15 @@ class DatabaseManager:
                                   ELSE LEAST(GREATEST((e.user_score / NULLIF(e.baseline_mean,0)) * 100.0, 0.0), 100.0)
                                   END
                               END
-                            ELSE
-                              NULL
+                            ELSE NULL
                           END AS tv_match_rate
                         FROM tb_employees_with_tv e
-                        """
-                    )
+                    """)
 
-                    # ===== 10) TV MATCH WITH WEIGHTS =====
-                    cur.execute(
-                        r"""
+                    # 9. TV match with weights
+                    cur.execute(r"""
                         CREATE TABLE tb_tv_match_with_weights AS
-                        SELECT
-                          t.*,
+                        SELECT t.*,
                           CASE
                             WHEN t.weights_config IS NULL THEN 1.0
                             WHEN (t.weights_config #>> ARRAY['TV_weights', t.tgv_name, t.tv_name]) ~ '^\s*[-+]?\d+(\.\d+)?\s*$'
@@ -397,20 +335,12 @@ class DatabaseManager:
                             ELSE 1.0
                           END AS tv_weight
                         FROM tb_tv_match_calc t
-                        """
-                    )
+                    """)
 
-                    # ===== 11) TGV AGGREGATION =====
-                    cur.execute(
-                        """
+                    # 10. TGV aggregation
+                    cur.execute("""
                         CREATE TABLE tb_tgv_aggregation AS
-                        SELECT
-                          employee_id,
-                          fullname,
-                          directorate,
-                          role,
-                          grade,
-                          tgv_name,
+                        SELECT employee_id, fullname, directorate, role, grade, tgv_name,
                           CASE
                             WHEN SUM(tv_weight) FILTER (WHERE tv_match_rate IS NOT NULL) = 0 THEN NULL
                             ELSE SUM(tv_match_rate * tv_weight) FILTER (WHERE tv_match_rate IS NOT NULL)
@@ -420,15 +350,12 @@ class DatabaseManager:
                           MIN(weights_config::text)::jsonb AS weights_config
                         FROM tb_tv_match_with_weights
                         GROUP BY employee_id, fullname, directorate, role, grade, tgv_name
-                        """
-                    )
+                    """)
 
-                    # ===== 12) TGV WITH WEIGHTS =====
-                    cur.execute(
-                        r"""
+                    # 11. TGV with weights
+                    cur.execute(r"""
                         CREATE TABLE tb_tgv_with_weights AS
-                        SELECT
-                          t.*,
+                        SELECT t.*,
                           CASE
                             WHEN t.weights_config IS NULL THEN
                               CASE t.tgv_name
@@ -456,19 +383,12 @@ class DatabaseManager:
                               END
                           END AS tgv_weight
                         FROM tb_tgv_aggregation t
-                        """
-                    )
+                    """)
 
-                    # ===== 13) FINAL AGGREGATION =====
-                    cur.execute(
-                        """
+                    # 12. Final aggregation
+                    cur.execute("""
                         CREATE TABLE tb_final_aggregation AS
-                        SELECT
-                          employee_id,
-                          fullname,
-                          directorate,
-                          role,
-                          grade,
+                        SELECT employee_id, fullname, directorate, role, grade,
                           CASE
                             WHEN SUM(tgv_weight) FILTER (WHERE tgv_match_rate IS NOT NULL) = 0 THEN NULL
                             ELSE SUM(tgv_match_rate * tgv_weight) FILTER (WHERE tgv_match_rate IS NOT NULL)
@@ -477,13 +397,11 @@ class DatabaseManager:
                           SUM(CASE WHEN tgv_match_rate IS NOT NULL THEN 1 ELSE 0 END) AS tgv_count_with_baseline
                         FROM tb_tgv_with_weights
                         GROUP BY employee_id, fullname, directorate, role, grade
-                        """
-                    )
+                    """)
 
-                    # commit all DDL/DML above
                     conn.commit()
 
-                    # ===== 14) FINAL SELECT - RETURN DETAILED RESULTS =====
+                    # 13. FINAL SELECT - RETURN WITH ALL NECESSARY COLUMNS
                     final_sql = """
                     SELECT
                       tm.employee_id,
@@ -493,13 +411,15 @@ class DatabaseManager:
                       tm.grade,
                       tm.tgv_name,
                       tm.tv_name,
-                      ROUND(tm.baseline_mean::numeric, 2) AS baseline_score,
+                      tm.scoring_direction,
+                      ROUND(tm.baseline_mean::numeric, 2) AS baseline_mean,
+                      ROUND(tm.baseline_stddev::numeric, 2) AS baseline_stddev,
                       ROUND(tm.user_score::numeric, 2) AS user_score,
                       ROUND(tm.tv_match_rate::numeric, 2) AS tv_match_rate,
-                      ROUND(tgv.tgv_match_rate::numeric, 4) AS tgv_match_rate,
-                      ROUND(fa.final_match_rate::numeric, 4) AS final_match_rate
+                      ROUND(COALESCE(tgv.tgv_match_rate, 0)::numeric, 2) AS tgv_match_rate,
+                      ROUND(COALESCE(fa.final_match_rate, 0)::numeric, 2) AS final_match_rate
                     FROM tb_tv_match_calc tm
-                    LEFT JOIN tb_tgv_with_weights tgv
+                    LEFT JOIN tb_tgv_aggregation tgv
                       ON tgv.employee_id = tm.employee_id
                      AND tgv.tgv_name = tm.tgv_name
                     LEFT JOIN tb_final_aggregation fa
@@ -510,38 +430,37 @@ class DatabaseManager:
                     """
 
                     df = pd.read_sql_query(final_sql, conn)
-                                        # read results into pandas DataFrame and sanitize numeric columns
 
-                    # safeguard: coerce numeric-like columns to numeric
-                    numeric_cols = ['baseline_score', 'user_score', 'tv_match_rate', 'tgv_match_rate', 'final_match_rate']
+                    # Post-process: ensure numeric columns
+                    numeric_cols = ['baseline_mean', 'baseline_stddev', 'user_score', 
+                                    'tv_match_rate', 'tgv_match_rate', 'final_match_rate']
                     for c in numeric_cols:
                         if c in df.columns:
                             df[c] = pd.to_numeric(df[c], errors='coerce')
 
-                    # ensure consistent naming: create final_match_rate_percentage if missing
-                    if 'final_match_rate' in df.columns and 'final_match_rate_percentage' not in df.columns:
-                        df = df.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
+                    # Rename for consistency
+                    if 'final_match_rate' in df.columns:
+                        df['final_match_rate_percentage'] = df['final_match_rate']
 
-                    # if values are in 0..1 scale, upscale to 0..100
-                    if 'final_match_rate_percentage' in df.columns:
-                        maxv = df['final_match_rate_percentage'].max(skipna=True)
-                        if pd.notna(maxv) and maxv <= 1.0:
-                            df['final_match_rate_percentage'] = df['final_match_rate_percentage'] * 100.0
+                    # Scale if needed (0..1 -> 0..100)
+                    for col in ['tv_match_rate', 'tgv_match_rate', 'final_match_rate_percentage']:
+                        if col in df.columns:
+                            maxv = df[col].max(skipna=True)
+                            if pd.notna(maxv) and 0 < maxv <= 1.0:
+                                df[col] = df[col] * 100.0
 
                     return df
 
             except Exception as e:
                 try:
                     conn.rollback()
-                except Exception:
+                except:
                     pass
                 st.error(f"❌ SQL Pipeline Error: {str(e)}")
                 raise
 
-    # ---------------------------------------------
-    # SUMMARY RESULTS
-    # ---------------------------------------------
     def get_summary_results(self, job_vacancy_id: int, limit: int = 50) -> pd.DataFrame:
+        """Get summary results from tb_final_aggregation"""
         query = """
         SELECT
           fa.employee_id,
@@ -559,6 +478,7 @@ class DatabaseManager:
         return self.execute_query(query, params=(limit,))
 
     def get_vacancy_info(self, job_vacancy_id: int) -> Dict:
+        """Get vacancy information"""
         query = "SELECT * FROM talent_benchmarks WHERE job_vacancy_id = %s"
         result = self.execute_query(query, params=(job_vacancy_id,))
         return result.iloc[0].to_dict() if not result.empty else {}
