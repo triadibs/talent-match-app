@@ -1,10 +1,10 @@
 # utils/database.py
 # -*- coding: utf-8 -*-
 """
-Database Manager for Talent Match System (fixed)
-- CREATE TEMP TABLE without schema prefix
-- Defensive get_summary_results: if temp final table not available, run pipeline and build summary
-- Preserve job_vacancy_id through pipeline
+Database Manager for Talent Match System (CTE-based)
+- Uses a single CTE pipeline (no TEMP tables) to compute matches.
+- Defensive get_summary_results builds summary from detailed results.
+- Tested for consistent indentation and parameter binding.
 """
 
 import psycopg
@@ -40,10 +40,14 @@ class DatabaseManager:
             raise ConnectionError(f"Cannot connect to database: {e}")
 
     def get_connection(self):
+        """Return psycopg connection with dict_row factory."""
         return psycopg.connect(**self.conn_params, row_factory=dict_row)
 
-    # Generic query
+    # -------------------------
+    # Generic helper
+    # -------------------------
     def execute_query(self, query: str, params: tuple = None, fetch: bool = True) -> pd.DataFrame:
+        """Execute SQL with optional params and return a pandas DataFrame (or empty DF)."""
         with self.get_connection() as conn:
             with conn.cursor() as cur:
                 if params:
@@ -58,7 +62,9 @@ class DatabaseManager:
                     conn.commit()
                     return pd.DataFrame()
 
+    # -------------------------
     # Home helpers
+    # -------------------------
     def get_total_employees(self) -> int:
         query = "SELECT COUNT(*) as count FROM employees"
         result = self.execute_query(query)
@@ -130,246 +136,242 @@ class DatabaseManager:
         json_data = Jsonb(weights_config) if weights_config else None
         with self.get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    query,
-                    (role_name, job_level, role_purpose, selected_talent_ids, json_data),
-                )
+                cur.execute(query, (role_name, job_level, role_purpose, selected_talent_ids, json_data))
                 row = cur.fetchone()
                 conn.commit()
                 return row["job_vacancy_id"]
 
     # ---------------------------
-    # Matching pipeline (fixed: no "temp." schema prefix)
+    # CTE-based Matching pipeline
     # ---------------------------
     def run_matching_query(self, job_vacancy_id: int) -> pd.DataFrame:
-    """
-    Matching pipeline implemented as a single CTE query (no temp tables).
-    Returns a detailed DataFrame (per-TV rows) for the given job_vacancy_id.
-    """
-    sql = r"""
-    WITH v AS (
-      SELECT job_vacancy_id, role_name, job_level, role_purpose, selected_talent_ids, weights_config
-      FROM talent_benchmarks
-      WHERE job_vacancy_id = %s
-    ),
-    ly AS (
-      SELECT MAX(year) AS max_year FROM competencies_yearly
-    ),
-    sel AS (
-      SELECT v.job_vacancy_id, unnest(v.selected_talent_ids) AS employee_id, v.weights_config
-      FROM v
-    ),
-    profiles_psych_norm AS (
-      SELECT employee_id, iq, gtq, faxtor, pauli, tiki
-      FROM profiles_psych
-    ),
-    tv_scores_long AS (
-      -- psychometric & cognitive
-      SELECT employee_id, 'cognitive_ability'::text AS tgv_name, 'iq'::text AS tv_name, (iq::text)::numeric AS tv_score, 'higher_better'::text AS scoring_direction
-      FROM profiles_psych_norm
-      WHERE iq IS NOT NULL AND trim(coalesce(iq::text,'')) <> '' AND (iq::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
+        """
+        Matching pipeline implemented as a single multi-CTE SQL statement.
+        Returns detailed per-TV rows for the given job_vacancy_id.
+        """
+        sql = r"""
+        WITH v AS (
+          SELECT job_vacancy_id, role_name, job_level, role_purpose, selected_talent_ids, weights_config
+          FROM talent_benchmarks
+          WHERE job_vacancy_id = %s
+        ),
+        ly AS (
+          SELECT MAX(year) AS max_year FROM competencies_yearly
+        ),
+        sel AS (
+          SELECT v.job_vacancy_id, unnest(v.selected_talent_ids) AS employee_id, v.weights_config
+          FROM v
+        ),
+        profiles_psych_norm AS (
+          SELECT employee_id, iq, gtq, faxtor, pauli, tiki
+          FROM profiles_psych
+        ),
+        tv_scores_long AS (
+          SELECT employee_id, 'cognitive_ability'::text AS tgv_name, 'iq'::text AS tv_name, (iq::text)::numeric AS tv_score, 'higher_better'::text AS scoring_direction
+          FROM profiles_psych_norm
+          WHERE iq IS NOT NULL AND trim(coalesce(iq::text,'')) <> '' AND (iq::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
 
-      UNION ALL
-      SELECT employee_id, 'cognitive_ability', 'gtq', (gtq::text)::numeric, 'higher_better'
-      FROM profiles_psych_norm
-      WHERE gtq IS NOT NULL AND trim(coalesce(gtq::text,'')) <> '' AND (gtq::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
+          UNION ALL
+          SELECT employee_id, 'cognitive_ability', 'gtq', (gtq::text)::numeric, 'higher_better'
+          FROM profiles_psych_norm
+          WHERE gtq IS NOT NULL AND trim(coalesce(gtq::text,'')) <> '' AND (gtq::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
 
-      UNION ALL
-      SELECT employee_id, 'attention_processing', 'faxtor', (faxtor::text)::numeric, 'higher_better'
-      FROM profiles_psych_norm
-      WHERE faxtor IS NOT NULL AND trim(coalesce(faxtor::text,'')) <> '' AND (faxtor::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
+          UNION ALL
+          SELECT employee_id, 'attention_processing', 'faxtor', (faxtor::text)::numeric, 'higher_better'
+          FROM profiles_psych_norm
+          WHERE faxtor IS NOT NULL AND trim(coalesce(faxtor::text,'')) <> '' AND (faxtor::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
 
-      UNION ALL
-      SELECT employee_id, 'attention_processing', 'pauli', (pauli::text)::numeric, 'higher_better'
-      FROM profiles_psych_norm
-      WHERE pauli IS NOT NULL AND trim(coalesce(pauli::text,'')) <> '' AND (pauli::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
+          UNION ALL
+          SELECT employee_id, 'attention_processing', 'pauli', (pauli::text)::numeric, 'higher_better'
+          FROM profiles_psych_norm
+          WHERE pauli IS NOT NULL AND trim(coalesce(pauli::text,'')) <> '' AND (pauli::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
 
-      UNION ALL
-      SELECT employee_id, 'attention_processing', 'tiki', (tiki::text)::numeric, 'higher_better'
-      FROM profiles_psych_norm
-      WHERE tiki IS NOT NULL AND trim(coalesce(tiki::text,'')) <> '' AND (tiki::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
+          UNION ALL
+          SELECT employee_id, 'attention_processing', 'tiki', (tiki::text)::numeric, 'higher_better'
+          FROM profiles_psych_norm
+          WHERE tiki IS NOT NULL AND trim(coalesce(tiki::text,'')) <> '' AND (tiki::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
 
-      UNION ALL
-      SELECT c.employee_id, 'leadership_competencies', c.pillar_code::text AS tv_name, (c.score::text)::numeric AS tv_score, 'higher_better'
-      FROM competencies_yearly c, ly
-      WHERE c.year = ly.max_year
-        AND c.score IS NOT NULL AND trim(coalesce(c.score::text,'')) <> '' AND (c.score::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
+          UNION ALL
+          SELECT c.employee_id, 'leadership_competencies', c.pillar_code::text AS tv_name, (c.score::text)::numeric AS tv_score, 'higher_better'
+          FROM competencies_yearly c, ly
+          WHERE c.year = ly.max_year
+            AND c.score IS NOT NULL AND trim(coalesce(c.score::text,'')) <> '' AND (c.score::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
 
-      UNION ALL
-      SELECT ps.employee_id, 'work_preferences', ('papi_' || lower(ps.scale_code))::text AS tv_name, (ps.score::text)::numeric AS tv_score,
-             CASE WHEN ps.scale_code IN ('Z','K') THEN 'lower_better' ELSE 'higher_better' END
-      FROM papi_scores ps
-      WHERE ps.score IS NOT NULL AND trim(coalesce(ps.score::text,'')) <> '' AND (ps.score::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
+          UNION ALL
+          SELECT ps.employee_id, 'work_preferences', ('papi_' || lower(ps.scale_code))::text AS tv_name, (ps.score::text)::numeric AS tv_score,
+                 CASE WHEN ps.scale_code IN ('Z','K') THEN 'lower_better' ELSE 'higher_better' END
+          FROM papi_scores ps
+          WHERE ps.score IS NOT NULL AND trim(coalesce(ps.score::text, '')) <> '' AND (ps.score::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
 
-      UNION ALL
-      SELECT e.employee_id, 'experience', 'years_of_service_months', (e.years_of_service_months::text)::numeric, 'higher_better'
-      FROM employees e
-      WHERE e.years_of_service_months IS NOT NULL AND trim(coalesce(e.years_of_service_months::text,'')) <> '' AND (e.years_of_service_months::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
-    ),
-    baseline_per_tv AS (
-      SELECT st.job_vacancy_id,
-             tv.tgv_name,
-             tv.tv_name,
-             tv.scoring_direction,
-             AVG(tv.tv_score) AS baseline_mean,
-             STDDEV_POP(tv.tv_score) AS baseline_stddev,
-             COUNT(DISTINCT tv.employee_id) AS benchmark_count
-      FROM sel st
-      JOIN tv_scores_long tv ON tv.employee_id = st.employee_id
-      GROUP BY st.job_vacancy_id, tv.tgv_name, tv.tv_name, tv.scoring_direction
-    ),
-    employees_with_tv AS (
-      SELECT
-        e.employee_id,
-        e.fullname,
-        dir.name AS directorate,
-        pos.name AS role,
-        gr.name AS grade,
-        v.job_vacancy_id,
-        tv.tgv_name,
-        tv.tv_name,
-        tv.tv_score AS user_score,
-        tv.scoring_direction,
-        b.baseline_mean,
-        b.baseline_stddev,
-        v.weights_config
-      FROM employees e
-      LEFT JOIN dim_directorates dir ON e.directorate_id = dir.directorate_id
-      LEFT JOIN dim_positions pos ON e.position_id = pos.position_id
-      LEFT JOIN dim_grades gr ON e.grade_id = gr.grade_id
-      CROSS JOIN v
-      LEFT JOIN tv_scores_long tv ON tv.employee_id = e.employee_id
-      LEFT JOIN baseline_per_tv b
-        ON b.job_vacancy_id = v.job_vacancy_id
-        AND b.tgv_name = tv.tgv_name
-        AND b.tv_name = tv.tv_name
-      WHERE tv.tv_score IS NOT NULL
-    ),
-    tv_match_calc AS (
-      SELECT
-        e.*,
-        CASE
-          WHEN e.baseline_mean IS NULL THEN NULL
-          WHEN e.scoring_direction = 'boolean' THEN CASE WHEN e.user_score = e.baseline_mean THEN 100.0 ELSE 0.0 END
-          WHEN e.baseline_stddev IS NOT NULL AND e.baseline_stddev <> 0 THEN
-            100.0 * (1.0 / (1.0 + exp( - ( (e.user_score - e.baseline_mean) / NULLIF(e.baseline_stddev,0) ) )))
-          WHEN e.baseline_mean IS NOT NULL AND (e.baseline_stddev IS NULL OR e.baseline_stddev = 0) THEN
-            CASE WHEN e.scoring_direction = 'lower_better' THEN
-              CASE WHEN e.user_score IS NULL OR e.baseline_mean = 0 THEN NULL
-              ELSE LEAST(GREATEST(((2.0 * e.baseline_mean - e.user_score) / NULLIF(e.baseline_mean,0)) * 100.0, 0.0), 100.0) END
-            ELSE
-              CASE WHEN e.user_score IS NULL OR e.baseline_mean = 0 THEN NULL
-              ELSE LEAST(GREATEST((e.user_score / NULLIF(e.baseline_mean,0)) * 100.0, 0.0), 100.0) END
-            END
-          ELSE NULL
-        END AS tv_match_rate
-      FROM employees_with_tv e
-    ),
-    tv_match_with_weights AS (
-      SELECT
-        t.*,
-        CASE
-          WHEN t.weights_config IS NULL THEN 1.0
-          WHEN (t.weights_config #>> ARRAY['TV_weights', t.tgv_name, t.tv_name]) ~ '^\s*[-+]?\d+(\.\d+)?\s*$'
-            THEN (t.weights_config #>> ARRAY['TV_weights', t.tgv_name, t.tv_name])::numeric
-          ELSE 1.0
-        END AS tv_weight
-      FROM tv_match_calc t
-    ),
-    tgv_aggregation AS (
-      SELECT
-        job_vacancy_id,
-        employee_id,
-        fullname,
-        directorate,
-        role,
-        grade,
-        tgv_name,
-        CASE
-          WHEN SUM(tv_weight) FILTER (WHERE tv_match_rate IS NOT NULL) = 0 THEN NULL
-          ELSE SUM(tv_match_rate * tv_weight) FILTER (WHERE tv_match_rate IS NOT NULL)
-               / NULLIF(SUM(tv_weight) FILTER (WHERE tv_match_rate IS NOT NULL), 0)
-        END AS tgv_match_rate,
-        COUNT(*) FILTER (WHERE tv_match_rate IS NOT NULL) AS tv_count_with_baseline,
-        MIN(weights_config::text)::jsonb AS weights_config
-      FROM tv_match_with_weights
-      GROUP BY job_vacancy_id, employee_id, fullname, directorate, role, grade, tgv_name
-    ),
-    tgv_with_weights AS (
-      SELECT
-        t.*,
-        CASE
-          WHEN t.weights_config IS NULL THEN
-            CASE t.tgv_name
-              WHEN 'interpersonal_skills' THEN 0.612
-              WHEN 'leadership_competencies' THEN 0.314
-              WHEN 'execution_competencies' THEN 0.041
-              WHEN 'attention_processing' THEN 0.016
-              WHEN 'cognitive_ability' THEN 0.009
-              WHEN 'experience' THEN 0.005
-              WHEN 'work_preferences' THEN 0.003
-              ELSE 1.0/7.0
-            END
-          WHEN (t.weights_config #>> ARRAY['TGV_weights', t.tgv_name]) ~ '^\s*[-+]?\d+(\.\d+)?\s*$'
-            THEN (t.weights_config #>> ARRAY['TGV_weights', t.tgv_name])::numeric
-          ELSE
-            CASE t.tgv_name
-              WHEN 'interpersonal_skills' THEN 0.612
-              WHEN 'leadership_competencies' THEN 0.314
-              WHEN 'execution_competencies' THEN 0.041
-              WHEN 'attention_processing' THEN 0.016
-              WHEN 'cognitive_ability' THEN 0.009
-              WHEN 'experience' THEN 0.005
-              WHEN 'work_preferences' THEN 0.003
-              ELSE 1.0/7.0
-            END
-        END AS tgv_weight
-      FROM tgv_aggregation t
-    ),
-    final_aggregation AS (
-      SELECT
-        job_vacancy_id,
-        employee_id,
-        fullname,
-        directorate,
-        role,
-        grade,
-        CASE
-          WHEN SUM(tgv_weight) FILTER (WHERE tgv_match_rate IS NOT NULL) = 0 THEN NULL
-          ELSE SUM(tgv_match_rate * tgv_weight) FILTER (WHERE tgv_match_rate IS NOT NULL)
-               / NULLIF(SUM(tgv_weight) FILTER (WHERE tgv_match_rate IS NOT NULL), 0)
-        END AS final_match_rate,
-        SUM(CASE WHEN tgv_match_rate IS NOT NULL THEN 1 ELSE 0 END) AS tgv_count_with_baseline
-      FROM tgv_with_weights
-      GROUP BY job_vacancy_id, employee_id, fullname, directorate, role, grade
-    )
-    SELECT
-      tm.job_vacancy_id,
-      tm.employee_id,
-      tm.fullname,
-      tm.directorate,
-      tm.role,
-      tm.grade,
-      tm.tgv_name,
-      tm.tv_name,
-      ROUND(tm.baseline_mean::numeric, 2) AS baseline_score,
-      ROUND(tm.user_score::numeric, 2) AS user_score,
-      ROUND(tm.tv_match_rate::numeric, 2) AS tv_match_rate,
-      ROUND(tgv.tgv_match_rate::numeric, 4) AS tgv_match_rate,
-      ROUND(fa.final_match_rate::numeric, 4) AS final_match_rate
-    FROM tv_match_calc tm
-    LEFT JOIN tgv_with_weights tgv
-      ON tgv.employee_id = tm.employee_id AND tgv.tgv_name = tm.tgv_name AND tgv.job_vacancy_id = tm.job_vacancy_id
-    LEFT JOIN final_aggregation fa
-      ON fa.employee_id = tm.employee_id AND fa.job_vacancy_id = tm.job_vacancy_id
-    WHERE tm.baseline_mean IS NOT NULL
-      AND tm.job_vacancy_id = %s
-    ORDER BY fa.final_match_rate DESC NULLS LAST, tm.employee_id, tm.tgv_name, tm.tv_name
-    """
-    with self.get_connection() as conn:
-        # Use pandas read_sql_query for convenience and parameter binding
-        df = pd.read_sql_query(sql, conn, params=(job_vacancy_id, job_vacancy_id))
-        # sanitize numeric columns (coerce)
+          UNION ALL
+          SELECT e.employee_id, 'experience', 'years_of_service_months', (e.years_of_service_months::text)::numeric, 'higher_better'
+          FROM employees e
+          WHERE e.years_of_service_months IS NOT NULL AND trim(coalesce(e.years_of_service_months::text,'')) <> '' AND (e.years_of_service_months::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
+        ),
+        baseline_per_tv AS (
+          SELECT st.job_vacancy_id,
+                 tv.tgv_name,
+                 tv.tv_name,
+                 tv.scoring_direction,
+                 AVG(tv.tv_score) AS baseline_mean,
+                 STDDEV_POP(tv.tv_score) AS baseline_stddev,
+                 COUNT(DISTINCT tv.employee_id) AS benchmark_count
+          FROM sel st
+          JOIN tv_scores_long tv ON tv.employee_id = st.employee_id
+          GROUP BY st.job_vacancy_id, tv.tgv_name, tv.tv_name, tv.scoring_direction
+        ),
+        employees_with_tv AS (
+          SELECT
+            e.employee_id,
+            e.fullname,
+            dir.name AS directorate,
+            pos.name AS role,
+            gr.name AS grade,
+            v.job_vacancy_id,
+            tv.tgv_name,
+            tv.tv_name,
+            tv.tv_score AS user_score,
+            tv.scoring_direction,
+            b.baseline_mean,
+            b.baseline_stddev,
+            v.weights_config
+          FROM employees e
+          LEFT JOIN dim_directorates dir ON e.directorate_id = dir.directorate_id
+          LEFT JOIN dim_positions pos ON e.position_id = pos.position_id
+          LEFT JOIN dim_grades gr ON e.grade_id = gr.grade_id
+          CROSS JOIN v
+          LEFT JOIN tv_scores_long tv ON tv.employee_id = e.employee_id
+          LEFT JOIN baseline_per_tv b
+            ON b.job_vacancy_id = v.job_vacancy_id
+            AND b.tgv_name = tv.tgv_name
+            AND b.tv_name = tv.tv_name
+          WHERE tv.tv_score IS NOT NULL
+        ),
+        tv_match_calc AS (
+          SELECT
+            e.*,
+            CASE
+              WHEN e.baseline_mean IS NULL THEN NULL
+              WHEN e.scoring_direction = 'boolean' THEN CASE WHEN e.user_score = e.baseline_mean THEN 100.0 ELSE 0.0 END
+              WHEN e.baseline_stddev IS NOT NULL AND e.baseline_stddev <> 0 THEN
+                100.0 * (1.0 / (1.0 + exp( - ( (e.user_score - e.baseline_mean) / NULLIF(e.baseline_stddev,0) ) )))
+              WHEN e.baseline_mean IS NOT NULL AND (e.baseline_stddev IS NULL OR e.baseline_stddev = 0) THEN
+                CASE WHEN e.scoring_direction = 'lower_better' THEN
+                  CASE WHEN e.user_score IS NULL OR e.baseline_mean = 0 THEN NULL
+                  ELSE LEAST(GREATEST(((2.0 * e.baseline_mean - e.user_score) / NULLIF(e.baseline_mean,0)) * 100.0, 0.0), 100.0) END
+                ELSE
+                  CASE WHEN e.user_score IS NULL OR e.baseline_mean = 0 THEN NULL
+                  ELSE LEAST(GREATEST((e.user_score / NULLIF(e.baseline_mean,0)) * 100.0, 0.0), 100.0) END
+                END
+              ELSE NULL
+            END AS tv_match_rate
+          FROM employees_with_tv e
+        ),
+        tv_match_with_weights AS (
+          SELECT
+            t.*,
+            CASE
+              WHEN t.weights_config IS NULL THEN 1.0
+              WHEN (t.weights_config #>> ARRAY['TV_weights', t.tgv_name, t.tv_name]) ~ '^\s*[-+]?\d+(\.\d+)?\s*$'
+                THEN (t.weights_config #>> ARRAY['TV_weights', t.tgv_name, t.tv_name])::numeric
+              ELSE 1.0
+            END AS tv_weight
+          FROM tv_match_calc t
+        ),
+        tgv_aggregation AS (
+          SELECT
+            job_vacancy_id,
+            employee_id,
+            fullname,
+            directorate,
+            role,
+            grade,
+            tgv_name,
+            CASE
+              WHEN SUM(tv_weight) FILTER (WHERE tv_match_rate IS NOT NULL) = 0 THEN NULL
+              ELSE SUM(tv_match_rate * tv_weight) FILTER (WHERE tv_match_rate IS NOT NULL)
+                   / NULLIF(SUM(tv_weight) FILTER (WHERE tv_match_rate IS NOT NULL), 0)
+            END AS tgv_match_rate,
+            COUNT(*) FILTER (WHERE tv_match_rate IS NOT NULL) AS tv_count_with_baseline,
+            MIN(weights_config::text)::jsonb AS weights_config
+          FROM tv_match_with_weights
+          GROUP BY job_vacancy_id, employee_id, fullname, directorate, role, grade, tgv_name
+        ),
+        tgv_with_weights AS (
+          SELECT
+            t.*,
+            CASE
+              WHEN t.weights_config IS NULL THEN
+                CASE t.tgv_name
+                  WHEN 'interpersonal_skills' THEN 0.612
+                  WHEN 'leadership_competencies' THEN 0.314
+                  WHEN 'execution_competencies' THEN 0.041
+                  WHEN 'attention_processing' THEN 0.016
+                  WHEN 'cognitive_ability' THEN 0.009
+                  WHEN 'experience' THEN 0.005
+                  WHEN 'work_preferences' THEN 0.003
+                  ELSE 1.0/7.0
+                END
+              WHEN (t.weights_config #>> ARRAY['TGV_weights', t.tgv_name]) ~ '^\s*[-+]?\d+(\.\d+)?\s*$'
+                THEN (t.weights_config #>> ARRAY['TGV_weights', t.tgv_name])::numeric
+              ELSE
+                CASE t.tgv_name
+                  WHEN 'interpersonal_skills' THEN 0.612
+                  WHEN 'leadership_competencies' THEN 0.314
+                  WHEN 'execution_competencies' THEN 0.041
+                  WHEN 'attention_processing' THEN 0.016
+                  WHEN 'cognitive_ability' THEN 0.009
+                  WHEN 'experience' THEN 0.005
+                  WHEN 'work_preferences' THEN 0.003
+                  ELSE 1.0/7.0
+                END
+            END AS tgv_weight
+          FROM tgv_aggregation t
+        ),
+        final_aggregation AS (
+          SELECT
+            job_vacancy_id,
+            employee_id,
+            fullname,
+            directorate,
+            role,
+            grade,
+            CASE
+              WHEN SUM(tgv_weight) FILTER (WHERE tgv_match_rate IS NOT NULL) = 0 THEN NULL
+              ELSE SUM(tgv_match_rate * tgv_weight) FILTER (WHERE tgv_match_rate IS NOT NULL)
+                   / NULLIF(SUM(tgv_weight) FILTER (WHERE tgv_match_rate IS NOT NULL), 0)
+            END AS final_match_rate,
+            SUM(CASE WHEN tgv_match_rate IS NOT NULL THEN 1 ELSE 0 END) AS tgv_count_with_baseline
+          FROM tgv_with_weights
+          GROUP BY job_vacancy_id, employee_id, fullname, directorate, role, grade
+        )
+        SELECT
+          tm.job_vacancy_id,
+          tm.employee_id,
+          tm.fullname,
+          tm.directorate,
+          tm.role,
+          tm.grade,
+          tm.tgv_name,
+          tm.tv_name,
+          ROUND(tm.baseline_mean::numeric, 2) AS baseline_score,
+          ROUND(tm.user_score::numeric, 2) AS user_score,
+          ROUND(tm.tv_match_rate::numeric, 2) AS tv_match_rate,
+          ROUND(tgv.tgv_match_rate::numeric, 4) AS tgv_match_rate,
+          ROUND(fa.final_match_rate::numeric, 4) AS final_match_rate
+        FROM tv_match_calc tm
+        LEFT JOIN tgv_with_weights tgv
+          ON tgv.employee_id = tm.employee_id AND tgv.tgv_name = tm.tgv_name AND tgv.job_vacancy_id = tm.job_vacancy_id
+        LEFT JOIN final_aggregation fa
+          ON fa.employee_id = tm.employee_id AND fa.job_vacancy_id = tm.job_vacancy_id
+        WHERE tm.baseline_mean IS NOT NULL
+          AND tm.job_vacancy_id = %s
+        ORDER BY fa.final_match_rate DESC NULLS LAST, tm.employee_id, tm.tgv_name, tm.tv_name
+        """
+        # we pass job_vacancy_id twice for the CTE v and the final filter; that's safe
+        with self.get_connection() as conn:
+            df = pd.read_sql_query(sql, conn, params=(job_vacancy_id, job_vacancy_id))
+        # sanitize numeric columns
         numeric_cols = ['baseline_score', 'user_score', 'tv_match_rate', 'tgv_match_rate', 'final_match_rate']
         for c in numeric_cols:
             if c in df.columns:
@@ -383,43 +385,44 @@ class DatabaseManager:
                 df['final_match_rate_percentage'] = df['final_match_rate_percentage'] * 100.0
         return df
 
-    # ---------------------------------------------
-    # SUMMARY RESULTS (defensive)
-    # ---------------------------------------------
+    # -------------------------
+    # Summary results (build from detailed if needed)
+    # -------------------------
     def get_summary_results(self, job_vacancy_id: int, limit: int = 50) -> pd.DataFrame:
-    """
-    Build summary by running the CTE pipeline and aggregating per employee.
-    This avoids relying on ephemeral temp tables.
-    """
-    detailed = self.run_matching_query(job_vacancy_id)
-    if detailed is None or detailed.empty:
-        return pd.DataFrame()
-    tmp = detailed.copy()
-    # ensure final_match_rate_percentage exists
-    if 'final_match_rate' in tmp.columns and 'final_match_rate_percentage' not in tmp.columns:
-        tmp = tmp.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
-    if 'final_match_rate_percentage' not in tmp.columns:
-        for c in ['final_match_rate', 'tgv_match_rate', 'tv_match_rate']:
-            if c in tmp.columns and pd.api.types.is_numeric_dtype(tmp[c]):
-                tmp['final_match_rate_percentage'] = tmp[c]
-                break
-    if 'final_match_rate_percentage' in tmp.columns:
-        tmp['final_match_rate_percentage'] = pd.to_numeric(tmp['final_match_rate_percentage'], errors='coerce')
-        maxv = tmp['final_match_rate_percentage'].max(skipna=True)
-        if pd.notna(maxv) and maxv <= 1.0:
-            tmp['final_match_rate_percentage'] = tmp['final_match_rate_percentage'] * 100.0
+        """
+        Build summary by running the CTE pipeline and aggregating per employee.
+        Avoid ephemeral temp tables by computing on-demand.
+        """
+        detailed = self.run_matching_query(job_vacancy_id)
+        if detailed is None or detailed.empty:
+            return pd.DataFrame()
 
-    summary = tmp.groupby('employee_id').agg({
-        'fullname': 'first',
-        'directorate': 'first',
-        'role': 'first',
-        'grade': 'first',
-        'final_match_rate_percentage': 'first'
-    }).reset_index()
+        tmp = detailed.copy()
+        if 'final_match_rate' in tmp.columns and 'final_match_rate_percentage' not in tmp.columns:
+            tmp = tmp.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
+        if 'final_match_rate_percentage' not in tmp.columns:
+            for c in ['final_match_rate', 'tgv_match_rate', 'tv_match_rate']:
+                if c in tmp.columns and pd.api.types.is_numeric_dtype(tmp[c]):
+                    tmp['final_match_rate_percentage'] = tmp[c]
+                    break
+        if 'final_match_rate_percentage' in tmp.columns:
+            tmp['final_match_rate_percentage'] = pd.to_numeric(tmp['final_match_rate_percentage'], errors='coerce')
+            maxv = tmp['final_match_rate_percentage'].max(skipna=True)
+            if pd.notna(maxv) and maxv <= 1.0:
+                tmp['final_match_rate_percentage'] = tmp['final_match_rate_percentage'] * 100.0
 
-    if not summary.empty:
-        summary = summary.sort_values('final_match_rate_percentage', ascending=False).head(limit)
-    return summary
+        summary = tmp.groupby('employee_id').agg({
+            'fullname': 'first',
+            'directorate': 'first',
+            'role': 'first',
+            'grade': 'first',
+            'final_match_rate_percentage': 'first'
+        }).reset_index()
+
+        if not summary.empty:
+            summary = summary.sort_values('final_match_rate_percentage', ascending=False).head(limit)
+
+        return summary
 
     def get_vacancy_info(self, job_vacancy_id: int) -> Dict:
         query = "SELECT * FROM talent_benchmarks WHERE job_vacancy_id = %s"
