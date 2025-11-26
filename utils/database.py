@@ -1,10 +1,10 @@
 # utils/database.py
 # -*- coding: utf-8 -*-
 """
-Database Manager for Talent Match System (fixed)
-- CREATE TEMP TABLE without schema prefix
-- Defensive get_summary_results: if temp final table not available, run pipeline and build summary
-- Preserve job_vacancy_id through pipeline
+Database Manager for Talent Match System (FIXED)
+- All CREATE TEMP TABLE without schema prefix
+- All references to temp tables without schema prefix
+- Fixed regex patterns for numeric validation
 """
 
 import psycopg
@@ -42,7 +42,6 @@ class DatabaseManager:
     def get_connection(self):
         return psycopg.connect(**self.conn_params, row_factory=dict_row)
 
-    # Generic query
     def execute_query(self, query: str, params: tuple = None, fetch: bool = True) -> pd.DataFrame:
         with self.get_connection() as conn:
             with conn.cursor() as cur:
@@ -58,7 +57,6 @@ class DatabaseManager:
                     conn.commit()
                     return pd.DataFrame()
 
-    # Home helpers
     def get_total_employees(self) -> int:
         query = "SELECT COUNT(*) as count FROM employees"
         result = self.execute_query(query)
@@ -138,90 +136,74 @@ class DatabaseManager:
                 conn.commit()
                 return row["job_vacancy_id"]
 
-    # ---------------------------
-    # Matching pipeline (fixed: no "temp." schema prefix)
-    # ---------------------------
     def run_matching_query(self, job_vacancy_id: int) -> pd.DataFrame:
         """
-        Matching pipeline using CREATE TEMP TABLE <name> (no schema prefix).
-        Returns detailed DataFrame for the given job_vacancy_id.
+        FIXED: All temp tables created WITHOUT schema prefix
         """
         with self.get_connection() as conn:
             try:
                 with conn.cursor() as cur:
+                    # Start transaction
                     cur.execute("BEGIN;")
 
-                    # Defensive drop of temp tables (no schema prefix)
-                    cur.execute(
-                        """
-                        DROP TABLE IF EXISTS tb_vacancy;
-                        DROP TABLE IF EXISTS tb_latest_year;
-                        DROP TABLE IF EXISTS tb_selected_talents;
-                        DROP TABLE IF EXISTS tb_profiles_psych_norm;
-                        DROP TABLE IF EXISTS tb_tv_scores_long;
-                        DROP TABLE IF EXISTS tb_baseline_per_tv;
-                        DROP TABLE IF EXISTS tb_employees_with_tv;
-                        DROP TABLE IF EXISTS tb_tv_match_calc;
-                        DROP TABLE IF EXISTS tb_tv_match_with_weights;
-                        DROP TABLE IF EXISTS tb_tgv_aggregation;
-                        DROP TABLE IF EXISTS tb_tgv_with_weights;
-                        DROP TABLE IF EXISTS tb_final_aggregation;
-                        """
-                    )
+                    # Drop all temp tables (NO SCHEMA PREFIX)
+                    cur.execute("""
+                        DROP TABLE IF EXISTS tb_vacancy CASCADE;
+                        DROP TABLE IF EXISTS tb_latest_year CASCADE;
+                        DROP TABLE IF EXISTS tb_selected_talents CASCADE;
+                        DROP TABLE IF EXISTS tb_profiles_psych_norm CASCADE;
+                        DROP TABLE IF EXISTS tb_tv_scores_long CASCADE;
+                        DROP TABLE IF EXISTS tb_baseline_per_tv CASCADE;
+                        DROP TABLE IF EXISTS tb_employees_with_tv CASCADE;
+                        DROP TABLE IF EXISTS tb_tv_match_calc CASCADE;
+                        DROP TABLE IF EXISTS tb_tv_match_with_weights CASCADE;
+                        DROP TABLE IF EXISTS tb_tgv_aggregation CASCADE;
+                        DROP TABLE IF EXISTS tb_tgv_with_weights CASCADE;
+                        DROP TABLE IF EXISTS tb_final_aggregation CASCADE;
+                    """)
 
-                    # Create temp tables (no "temp." prefix)
-                    cur.execute(
-                        """
+                    # 1. Vacancy table
+                    cur.execute("""
                         CREATE TEMP TABLE tb_vacancy AS
-                        SELECT job_vacancy_id, role_name, job_level, role_purpose, selected_talent_ids, weights_config
+                        SELECT job_vacancy_id, role_name, job_level, role_purpose, 
+                               selected_talent_ids, weights_config
                         FROM talent_benchmarks
                         WHERE job_vacancy_id = %s
-                        """,
-                        (job_vacancy_id,),
-                    )
+                    """, (job_vacancy_id,))
 
-                    # Check vacancy exists
+                    # Verify vacancy exists
                     cur.execute("SELECT COUNT(*) AS cnt FROM tb_vacancy;")
-                    cnt_v = cur.fetchone()["cnt"]
-                    if cnt_v == 0:
+                    if cur.fetchone()["cnt"] == 0:
                         conn.rollback()
-                        raise ValueError(f"Job vacancy {job_vacancy_id} not found in talent_benchmarks.")
+                        raise ValueError(f"Job vacancy {job_vacancy_id} not found")
 
-                    cur.execute(
-                        """
+                    # 2. Latest year
+                    cur.execute("""
                         CREATE TEMP TABLE tb_latest_year AS
                         SELECT MAX(year) AS max_year
                         FROM competencies_yearly
-                        """
-                    )
+                    """)
 
-                    cur.execute(
-                        """
+                    # 3. Selected talents
+                    cur.execute("""
                         CREATE TEMP TABLE tb_selected_talents AS
                         SELECT v.job_vacancy_id,
                                unnest(v.selected_talent_ids) AS employee_id,
                                v.weights_config
                         FROM tb_vacancy v
-                        """
-                    )
+                    """)
 
-                    cur.execute(
-                        """
+                    # 4. Psych profiles
+                    cur.execute("""
                         CREATE TEMP TABLE tb_profiles_psych_norm AS
-                        SELECT
-                          employee_id,
-                          iq,
-                          gtq,
-                          faxtor,
-                          pauli,
-                          tiki
+                        SELECT employee_id, iq, gtq, faxtor, pauli, tiki
                         FROM profiles_psych
-                        """
-                    )
+                    """)
 
-                    cur.execute(
-                        r"""
+                    # 5. TV scores long (FIXED REGEX)
+                    cur.execute("""
                         CREATE TEMP TABLE tb_tv_scores_long AS
+                        -- Cognitive Ability: IQ
                         SELECT employee_id,
                                'cognitive_ability'::text AS tgv_name,
                                'iq'::text AS tv_name,
@@ -229,92 +211,111 @@ class DatabaseManager:
                                'higher_better'::text AS scoring_direction
                         FROM tb_profiles_psych_norm
                         WHERE iq IS NOT NULL
-                          AND trim(coalesce(iq::text,'')) <> ''
-                          AND (iq::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
+                          AND trim(coalesce(iq::text, '')) <> ''
+                          AND iq::text ~ '^[0-9]+\.?[0-9]*$'
 
                         UNION ALL
-                        SELECT employee_id, 'cognitive_ability', 'gtq', (gtq::text)::numeric, 'higher_better'
+                        -- Cognitive Ability: GTQ
+                        SELECT employee_id, 'cognitive_ability', 'gtq',
+                               (gtq::text)::numeric, 'higher_better'
                         FROM tb_profiles_psych_norm
-                        WHERE gtq IS NOT NULL AND trim(coalesce(gtq::text,'')) <> ''
-                          AND (gtq::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
+                        WHERE gtq IS NOT NULL
+                          AND trim(coalesce(gtq::text, '')) <> ''
+                          AND gtq::text ~ '^[0-9]+\.?[0-9]*$'
 
                         UNION ALL
-                        SELECT employee_id, 'attention_processing', 'faxtor', (faxtor::text)::numeric, 'higher_better'
+                        -- Attention Processing: Faxtor
+                        SELECT employee_id, 'attention_processing', 'faxtor',
+                               (faxtor::text)::numeric, 'higher_better'
                         FROM tb_profiles_psych_norm
-                        WHERE faxtor IS NOT NULL AND trim(coalesce(faxtor::text,'')) <> ''
-                          AND (faxtor::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
+                        WHERE faxtor IS NOT NULL
+                          AND trim(coalesce(faxtor::text, '')) <> ''
+                          AND faxtor::text ~ '^[0-9]+\.?[0-9]*$'
 
                         UNION ALL
-                        SELECT employee_id, 'attention_processing', 'pauli', (pauli::text)::numeric, 'higher_better'
+                        -- Attention Processing: Pauli
+                        SELECT employee_id, 'attention_processing', 'pauli',
+                               (pauli::text)::numeric, 'higher_better'
                         FROM tb_profiles_psych_norm
-                        WHERE pauli IS NOT NULL AND trim(coalesce(pauli::text,'')) <> ''
-                          AND (pauli::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
+                        WHERE pauli IS NOT NULL
+                          AND trim(coalesce(pauli::text, '')) <> ''
+                          AND pauli::text ~ '^[0-9]+\.?[0-9]*$'
 
                         UNION ALL
-                        SELECT employee_id, 'attention_processing', 'tiki', (tiki::text)::numeric, 'higher_better'
+                        -- Attention Processing: Tiki
+                        SELECT employee_id, 'attention_processing', 'tiki',
+                               (tiki::text)::numeric, 'higher_better'
                         FROM tb_profiles_psych_norm
-                        WHERE tiki IS NOT NULL AND trim(coalesce(tiki::text,'')) <> ''
-                          AND (tiki::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
+                        WHERE tiki IS NOT NULL
+                          AND trim(coalesce(tiki::text, '')) <> ''
+                          AND tiki::text ~ '^[0-9]+\.?[0-9]*$'
 
                         UNION ALL
-                        SELECT c.employee_id, 'leadership_competencies', c.pillar_code::text AS tv_name, (c.score::text)::numeric, 'higher_better'
-                        FROM competencies_yearly c, tb_latest_year ly
+                        -- Leadership Competencies
+                        SELECT c.employee_id, 'leadership_competencies',
+                               c.pillar_code::text AS tv_name,
+                               (c.score::text)::numeric, 'higher_better'
+                        FROM competencies_yearly c
+                        CROSS JOIN tb_latest_year ly
                         WHERE c.year = ly.max_year
-                          AND c.score IS NOT NULL AND trim(coalesce(c.score::text,'')) <> ''
-                          AND (c.score::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
+                          AND c.score IS NOT NULL
+                          AND trim(coalesce(c.score::text, '')) <> ''
+                          AND c.score::text ~ '^[0-9]+\.?[0-9]*$'
 
                         UNION ALL
-                        SELECT ps.employee_id, 'work_preferences', ('papi_' || lower(ps.scale_code))::text AS tv_name,
+                        -- Work Preferences (PAPI)
+                        SELECT ps.employee_id, 'work_preferences',
+                               ('papi_' || lower(ps.scale_code))::text AS tv_name,
                                (ps.score::text)::numeric,
-                               CASE WHEN ps.scale_code IN ('Z','K') THEN 'lower_better' ELSE 'higher_better' END
+                               CASE WHEN ps.scale_code IN ('Z','K') 
+                                    THEN 'lower_better' 
+                                    ELSE 'higher_better' END
                         FROM papi_scores ps
-                        WHERE ps.score IS NOT NULL AND trim(coalesce(ps.score::text, '')) <> ''
-                          AND (ps.score::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
+                        WHERE ps.score IS NOT NULL
+                          AND trim(coalesce(ps.score::text, '')) <> ''
+                          AND ps.score::text ~ '^[0-9]+\.?[0-9]*$'
 
                         UNION ALL
+                        -- Experience
                         SELECT e.employee_id, 'experience', 'years_of_service_months',
                                (e.years_of_service_months::text)::numeric, 'higher_better'
                         FROM employees e
                         WHERE e.years_of_service_months IS NOT NULL
                           AND trim(coalesce(e.years_of_service_months::text, '')) <> ''
-                          AND (e.years_of_service_months::text ~ '^\s*[-+]?\d+(\.\d+)?\s*$')
-                        """
-                    )
+                          AND e.years_of_service_months::text ~ '^[0-9]+\.?[0-9]*$'
+                    """)
 
-                    cur.execute(
-                        """
+                    # 6. Baseline per TV
+                    cur.execute("""
                         CREATE TEMP TABLE tb_baseline_per_tv AS
-                        SELECT
-                          st.job_vacancy_id,
-                          tv.tgv_name,
-                          tv.tv_name,
-                          tv.scoring_direction,
-                          AVG(tv.tv_score) AS baseline_mean,
-                          STDDEV_POP(tv.tv_score) AS baseline_stddev,
-                          COUNT(DISTINCT tv.employee_id) AS benchmark_count
+                        SELECT st.job_vacancy_id,
+                               tv.tgv_name,
+                               tv.tv_name,
+                               tv.scoring_direction,
+                               AVG(tv.tv_score) AS baseline_mean,
+                               STDDEV_POP(tv.tv_score) AS baseline_stddev,
+                               COUNT(DISTINCT tv.employee_id) AS benchmark_count
                         FROM tb_selected_talents st
                         JOIN tb_tv_scores_long tv ON tv.employee_id = st.employee_id
                         GROUP BY st.job_vacancy_id, tv.tgv_name, tv.tv_name, tv.scoring_direction
-                        """
-                    )
+                    """)
 
-                    cur.execute(
-                        """
+                    # 7. Employees with TV
+                    cur.execute("""
                         CREATE TEMP TABLE tb_employees_with_tv AS
-                        SELECT
-                          e.employee_id,
-                          e.fullname,
-                          dir.name AS directorate,
-                          pos.name AS role,
-                          gr.name AS grade,
-                          tv.tgv_name,
-                          tv.tv_name,
-                          tv.tv_score AS user_score,
-                          tv.scoring_direction,
-                          b.baseline_mean,
-                          b.baseline_stddev,
-                          v.weights_config,
-                          v.job_vacancy_id
+                        SELECT e.employee_id,
+                               e.fullname,
+                               dir.name AS directorate,
+                               pos.name AS role,
+                               gr.name AS grade,
+                               tv.tgv_name,
+                               tv.tv_name,
+                               tv.tv_score AS user_score,
+                               tv.scoring_direction,
+                               b.baseline_mean,
+                               b.baseline_stddev,
+                               v.weights_config,
+                               v.job_vacancy_id
                         FROM employees e
                         LEFT JOIN dim_directorates dir ON e.directorate_id = dir.directorate_id
                         LEFT JOIN dim_positions pos ON e.position_id = pos.position_id
@@ -326,83 +327,84 @@ class DatabaseManager:
                           AND b.tgv_name = tv.tgv_name
                           AND b.tv_name = tv.tv_name
                         WHERE tv.tv_score IS NOT NULL
-                        """
-                    )
+                    """)
 
-                    cur.execute(
-                        """
+                    # 8. TV match calculation
+                    cur.execute("""
                         CREATE TEMP TABLE tb_tv_match_calc AS
-                        SELECT
-                          e.*,
+                        SELECT e.*,
                           CASE
                             WHEN e.baseline_mean IS NULL THEN NULL
                             WHEN e.scoring_direction = 'boolean' THEN
                               CASE WHEN e.user_score = e.baseline_mean THEN 100.0 ELSE 0.0 END
                             WHEN e.baseline_stddev IS NOT NULL AND e.baseline_stddev <> 0 THEN
-                              (
-                                100.0 * (1.0 / (1.0 + exp( - ( (e.user_score - e.baseline_mean) / NULLIF(e.baseline_stddev, 0) ) ))))
-                            WHEN e.baseline_mean IS NOT NULL AND (e.baseline_stddev IS NULL OR e.baseline_stddev = 0) THEN
+                              (100.0 * (1.0 / (1.0 + exp(- ((e.user_score - e.baseline_mean) 
+                                / NULLIF(e.baseline_stddev, 0))))))
+                            WHEN e.baseline_mean IS NOT NULL 
+                                 AND (e.baseline_stddev IS NULL OR e.baseline_stddev = 0) THEN
                               CASE
                                 WHEN e.scoring_direction = 'lower_better' THEN
                                   CASE WHEN e.user_score IS NULL OR e.baseline_mean = 0 THEN NULL
-                                  ELSE LEAST(GREATEST(((2.0 * e.baseline_mean - e.user_score) / NULLIF(e.baseline_mean,0)) * 100.0, 0.0), 100.0)
+                                  ELSE LEAST(GREATEST(
+                                    ((2.0 * e.baseline_mean - e.user_score) 
+                                      / NULLIF(e.baseline_mean, 0)) * 100.0, 0.0), 100.0)
                                   END
                                 ELSE
                                   CASE WHEN e.user_score IS NULL OR e.baseline_mean = 0 THEN NULL
-                                  ELSE LEAST(GREATEST((e.user_score / NULLIF(e.baseline_mean,0)) * 100.0, 0.0), 100.0)
+                                  ELSE LEAST(GREATEST(
+                                    (e.user_score / NULLIF(e.baseline_mean, 0)) * 100.0, 0.0), 100.0)
                                   END
                               END
-                            ELSE
-                              NULL
+                            ELSE NULL
                           END AS tv_match_rate
                         FROM tb_employees_with_tv e
-                        """
-                    )
+                    """)
 
-                    cur.execute(
-                        r"""
+                    # 9. TV match with weights
+                    cur.execute("""
                         CREATE TEMP TABLE tb_tv_match_with_weights AS
-                        SELECT
-                          t.*,
+                        SELECT t.*,
                           CASE
                             WHEN t.weights_config IS NULL THEN 1.0
-                            WHEN (t.weights_config #>> ARRAY['TV_weights', t.tgv_name, t.tv_name]) ~ '^\s*[-+]?\d+(\.\d+)?\s*$'
+                            WHEN (t.weights_config #>> ARRAY['TV_weights', t.tgv_name, t.tv_name]) 
+                                 ~ '^[0-9]+\.?[0-9]*$'
                               THEN (t.weights_config #>> ARRAY['TV_weights', t.tgv_name, t.tv_name])::numeric
                             ELSE 1.0
                           END AS tv_weight
                         FROM tb_tv_match_calc t
-                        """
-                    )
+                    """)
 
-                    cur.execute(
-                        """
+                    # 10. TGV aggregation
+                    cur.execute("""
                         CREATE TEMP TABLE tb_tgv_aggregation AS
-                        SELECT
-                          v.job_vacancy_id,
-                          employee_id,
-                          fullname,
-                          directorate,
-                          role,
-                          grade,
-                          tgv_name,
-                          CASE
-                            WHEN SUM(tv_weight) FILTER (WHERE tv_match_rate IS NOT NULL) = 0 THEN NULL
-                            ELSE SUM(tv_match_rate * tv_weight) FILTER (WHERE tv_match_rate IS NOT NULL)
-                                 / NULLIF(SUM(tv_weight) FILTER (WHERE tv_match_rate IS NOT NULL), 0)
-                          END AS tgv_match_rate,
-                          COUNT(*) FILTER (WHERE tv_match_rate IS NOT NULL) AS tv_count_with_baseline,
-                          MIN(weights_config::text)::jsonb AS weights_config
+                        SELECT v.job_vacancy_id,
+                               tm.employee_id,
+                               tm.fullname,
+                               tm.directorate,
+                               tm.role,
+                               tm.grade,
+                               tm.tgv_name,
+                               CASE
+                                 WHEN SUM(tm.tv_weight) FILTER (WHERE tm.tv_match_rate IS NOT NULL) = 0 
+                                   THEN NULL
+                                 ELSE SUM(tm.tv_match_rate * tm.tv_weight) 
+                                      FILTER (WHERE tm.tv_match_rate IS NOT NULL)
+                                      / NULLIF(SUM(tm.tv_weight) 
+                                               FILTER (WHERE tm.tv_match_rate IS NOT NULL), 0)
+                               END AS tgv_match_rate,
+                               COUNT(*) FILTER (WHERE tm.tv_match_rate IS NOT NULL) 
+                                 AS tv_count_with_baseline,
+                               MIN(tm.weights_config::text)::jsonb AS weights_config
                         FROM tb_tv_match_with_weights tm
                         JOIN tb_vacancy v ON v.job_vacancy_id = tm.job_vacancy_id
-                        GROUP BY v.job_vacancy_id, employee_id, fullname, directorate, role, grade, tgv_name
-                        """
-                    )
+                        GROUP BY v.job_vacancy_id, tm.employee_id, tm.fullname, 
+                                 tm.directorate, tm.role, tm.grade, tm.tgv_name
+                    """)
 
-                    cur.execute(
-                        r"""
+                    # 11. TGV with weights
+                    cur.execute("""
                         CREATE TEMP TABLE tb_tgv_with_weights AS
-                        SELECT
-                          t.*,
+                        SELECT t.*,
                           CASE
                             WHEN t.weights_config IS NULL THEN
                               CASE t.tgv_name
@@ -415,7 +417,8 @@ class DatabaseManager:
                                 WHEN 'work_preferences' THEN 0.003
                                 ELSE 1.0 / 7.0
                               END
-                            WHEN (t.weights_config #>> ARRAY['TGV_weights', t.tgv_name]) ~ '^\s*[-+]?\d+(\.\d+)?\s*$'
+                            WHEN (t.weights_config #>> ARRAY['TGV_weights', t.tgv_name]) 
+                                 ~ '^[0-9]+\.?[0-9]*$'
                               THEN (t.weights_config #>> ARRAY['TGV_weights', t.tgv_name])::numeric
                             ELSE
                               CASE t.tgv_name
@@ -430,56 +433,57 @@ class DatabaseManager:
                               END
                           END AS tgv_weight
                         FROM tb_tgv_aggregation t
-                        """
-                    )
+                    """)
 
-                    cur.execute(
-                        """
+                    # 12. Final aggregation
+                    cur.execute("""
                         CREATE TEMP TABLE tb_final_aggregation AS
-                        SELECT
-                          job_vacancy_id,
-                          employee_id,
-                          fullname,
-                          directorate,
-                          role,
-                          grade,
-                          CASE
-                            WHEN SUM(tgv_weight) FILTER (WHERE tgv_match_rate IS NOT NULL) = 0 THEN NULL
-                            ELSE SUM(tgv_match_rate * tgv_weight) FILTER (WHERE tgv_match_rate IS NOT NULL)
-                                 / NULLIF(SUM(tgv_weight) FILTER (WHERE tgv_match_rate IS NOT NULL), 0)
-                          END AS final_match_rate,
-                          SUM(CASE WHEN tgv_match_rate IS NOT NULL THEN 1 ELSE 0 END) AS tgv_count_with_baseline
+                        SELECT job_vacancy_id,
+                               employee_id,
+                               fullname,
+                               directorate,
+                               role,
+                               grade,
+                               CASE
+                                 WHEN SUM(tgv_weight) FILTER (WHERE tgv_match_rate IS NOT NULL) = 0 
+                                   THEN NULL
+                                 ELSE SUM(tgv_match_rate * tgv_weight) 
+                                      FILTER (WHERE tgv_match_rate IS NOT NULL)
+                                      / NULLIF(SUM(tgv_weight) 
+                                               FILTER (WHERE tgv_match_rate IS NOT NULL), 0)
+                               END AS final_match_rate,
+                               SUM(CASE WHEN tgv_match_rate IS NOT NULL THEN 1 ELSE 0 END) 
+                                 AS tgv_count_with_baseline
                         FROM tb_tgv_with_weights
                         GROUP BY job_vacancy_id, employee_id, fullname, directorate, role, grade
-                        """
-                    )
+                    """)
 
+                    # Commit all temp table creations
                     conn.commit()
 
-                    # Final select for requested vacancy
+                    # Final SELECT (references temp tables WITHOUT prefix)
                     final_sql = """
-                    SELECT
-                      tm.job_vacancy_id,
-                      tm.employee_id,
-                      tm.fullname,
-                      tm.directorate,
-                      tm.role,
-                      tm.grade,
-                      tm.tgv_name,
-                      tm.tv_name,
-                      ROUND(tm.baseline_mean::numeric, 2) AS baseline_score,
-                      ROUND(tm.user_score::numeric, 2) AS user_score,
-                      ROUND(tm.tv_match_rate::numeric, 2) AS tv_match_rate,
-                      ROUND(tgv.tgv_match_rate::numeric, 4) AS tgv_match_rate,
-                      ROUND(fa.final_match_rate::numeric, 4) AS final_match_rate
+                    SELECT tm.job_vacancy_id,
+                           tm.employee_id,
+                           tm.fullname,
+                           tm.directorate,
+                           tm.role,
+                           tm.grade,
+                           tm.tgv_name,
+                           tm.tv_name,
+                           ROUND(tm.baseline_mean::numeric, 2) AS baseline_score,
+                           ROUND(tm.user_score::numeric, 2) AS user_score,
+                           ROUND(tm.tv_match_rate::numeric, 2) AS tv_match_rate,
+                           ROUND(tgv.tgv_match_rate::numeric, 4) AS tgv_match_rate,
+                           ROUND(fa.final_match_rate::numeric, 4) AS final_match_rate
                     FROM tb_tv_match_calc tm
                     LEFT JOIN tb_tgv_with_weights tgv
                       ON tgv.employee_id = tm.employee_id
-                     AND tgv.tgv_name = tm.tgv_name
-                     AND tgv.job_vacancy_id = tm.job_vacancy_id
+                      AND tgv.tgv_name = tm.tgv_name
+                      AND tgv.job_vacancy_id = tm.job_vacancy_id
                     LEFT JOIN tb_final_aggregation fa
                       ON fa.employee_id = tm.employee_id
-                     AND fa.job_vacancy_id = tm.job_vacancy_id
+                      AND fa.job_vacancy_id = tm.job_vacancy_id
                     WHERE tm.baseline_mean IS NOT NULL
                       AND tm.job_vacancy_id = %s
                     ORDER BY fa.final_match_rate DESC NULLS LAST,
@@ -488,19 +492,21 @@ class DatabaseManager:
 
                     df = pd.read_sql_query(final_sql, conn, params=(job_vacancy_id,))
 
-                    # sanitize numeric columns
-                    numeric_cols = ['baseline_score', 'user_score', 'tv_match_rate', 'tgv_match_rate', 'final_match_rate']
+                    # Sanitize numeric columns
+                    numeric_cols = ['baseline_score', 'user_score', 'tv_match_rate', 
+                                    'tgv_match_rate', 'final_match_rate']
                     for c in numeric_cols:
                         if c in df.columns:
                             df[c] = pd.to_numeric(df[c], errors='coerce')
 
-                    # rename and scale
-                    if 'final_match_rate' in df.columns and 'final_match_rate_percentage' not in df.columns:
+                    # Rename and scale
+                    if 'final_match_rate' in df.columns:
                         df = df.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
+                    
                     if 'final_match_rate_percentage' in df.columns:
                         maxv = df['final_match_rate_percentage'].max(skipna=True)
                         if pd.notna(maxv) and maxv <= 1.0:
-                            df['final_match_rate_percentage'] = df['final_match_rate_percentage'] * 100.0
+                            df['final_match_rate_percentage'] *= 100.0
 
                     return df
 
@@ -512,25 +518,17 @@ class DatabaseManager:
                 st.error(f"❌ SQL Pipeline Error: {str(e)}")
                 raise
 
-    # ---------------------------------------------
-    # SUMMARY RESULTS (defensive)
-    # ---------------------------------------------
     def get_summary_results(self, job_vacancy_id: int, limit: int = 50) -> pd.DataFrame:
-        """
-        Try to read from tb_final_aggregation (if temp exists in same session).
-        If not available or empty, run the pipeline and build a summary from the returned detailed DataFrame.
-        """
+        """Defensive summary: run pipeline if temp table unavailable"""
         try:
-            # Try direct read (may fail if temp table not present in this connection)
             query = """
-            SELECT
-              fa.employee_id,
-              fa.fullname,
-              fa.directorate,
-              fa.role,
-              fa.grade,
-              ROUND(fa.final_match_rate::numeric, 2) AS final_match_rate_percentage,
-              fa.tgv_count_with_baseline
+            SELECT fa.employee_id,
+                   fa.fullname,
+                   fa.directorate,
+                   fa.role,
+                   fa.grade,
+                   ROUND(fa.final_match_rate::numeric, 2) AS final_match_rate_percentage,
+                   fa.tgv_count_with_baseline
             FROM tb_final_aggregation fa
             WHERE fa.job_vacancy_id = %s
               AND fa.final_match_rate IS NOT NULL
@@ -541,28 +539,24 @@ class DatabaseManager:
             if df is not None and not df.empty:
                 return df
         except Exception:
-            # likely temp table not present in this connection — fallthrough to run pipeline
             pass
 
-        # Fallback: run pipeline (this will build temp tables in a fresh connection and return detailed rows)
+        # Fallback: run pipeline
         detailed = self.run_matching_query(job_vacancy_id)
         if detailed is None or detailed.empty:
             return pd.DataFrame()
 
-        # Build summary from detailed
+        # Build summary
         tmp = detailed.copy()
-        if 'final_match_rate' in tmp.columns and 'final_match_rate_percentage' not in tmp.columns:
+        if 'final_match_rate' in tmp.columns:
             tmp = tmp.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
-        if 'final_match_rate_percentage' not in tmp.columns:
-            for c in ['final_match_rate', 'tgv_match_rate', 'tv_match_rate']:
-                if c in tmp.columns and pd.api.types.is_numeric_dtype(tmp[c]):
-                    tmp['final_match_rate_percentage'] = tmp[c]
-                    break
+        
         if 'final_match_rate_percentage' in tmp.columns:
-            tmp['final_match_rate_percentage'] = pd.to_numeric(tmp['final_match_rate_percentage'], errors='coerce')
+            tmp['final_match_rate_percentage'] = pd.to_numeric(
+                tmp['final_match_rate_percentage'], errors='coerce')
             maxv = tmp['final_match_rate_percentage'].max(skipna=True)
             if pd.notna(maxv) and maxv <= 1.0:
-                tmp['final_match_rate_percentage'] = tmp['final_match_rate_percentage'] * 100.0
+                tmp['final_match_rate_percentage'] *= 100.0
 
         summary = tmp.groupby('employee_id').agg({
             'fullname': 'first',
@@ -572,9 +566,9 @@ class DatabaseManager:
             'final_match_rate_percentage': 'first'
         }).reset_index()
 
-        # Limit rows
         if not summary.empty:
-            summary = summary.sort_values('final_match_rate_percentage', ascending=False).head(limit)
+            summary = summary.sort_values(
+                'final_match_rate_percentage', ascending=False).head(limit)
 
         return summary
 
