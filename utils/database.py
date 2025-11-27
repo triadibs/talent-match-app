@@ -174,164 +174,146 @@ class DatabaseManager:
     # RUN MATCHING PIPELINE (revised: z-score + logistic)
     # ---------------------------------------------
     def run_matching_query(self, vacancy_id: int) -> pd.DataFrame:
-        """
-        Full SQL pipeline for Talent Match Step 2.
-        Always returns detailed rows including TGV + TV levels.
-        Compatible with Page Analytics (radar, heatmap, strengths-gaps).
-        """
+    """
+    Full SQL pipeline for Talent Match Step 2.
+    Always returns detailed rows including TGV + TV levels.
+    Compatible with Page Analytics.
+    """
 
-        sql = """
-        WITH vacancy AS (
-            SELECT 
-                job_vacancy_id,
-                role_name,
-                job_level,
-                role_purpose,
-                selected_talent_ids,
-                weights_config
-            FROM talent_benchmarks
-            WHERE job_vacancy_id = %(vacancy_id)s
-        ),
+    sql = """
+WITH vacancy AS (
+    SELECT 
+        job_vacancy_id,
+        role_name,
+        job_level,
+        role_purpose,
+        selected_talent_ids,
+        weights_config
+    FROM talent_benchmarks
+    WHERE job_vacancy_id = %(vacancy_id)s
+),
 
-        -- 1) Expand selected benchmark employee IDs
-        selected_benchmarks AS (
-            SELECT 
-                v.job_vacancy_id,
-                (jsonb_array_elements_text(v.selected_talent_ids))::text AS employee_id
-            FROM vacancy v
-        ),
+selected_benchmarks AS (
+    SELECT 
+        v.job_vacancy_id,
+        (jsonb_array_elements_text(v.selected_talent_ids))::text AS employee_id
+    FROM vacancy v
+),
 
-        -- 2) TV Scores (normalized long format)
-        -- You MUST already have tb_tv_scores_long materialized OR we recreate the logic here.
-        tv_raw AS (
-            SELECT
-                e.employee_id,
-                e.fullname,
-                d.name AS directorate,
-                p.name AS role,
-                g.name AS grade,
-                tv.tgv_name,
-                tv.tv_name,
-                tv.score AS tv_score,
-                tv.scoring_direction
-            FROM employees e
-            LEFT JOIN dim_directorates d ON d.directorate_id = e.directorate_id
-            LEFT JOIN dim_positions p ON p.position_id = e.position_id
-            LEFT JOIN dim_grades g ON g.grade_id = e.grade_id
+tv_raw AS (
+    SELECT
+        e.employee_id,
+        e.fullname,
+        d.name AS directorate,
+        p.name AS role,
+        g.name AS grade,
+        tv.tgv_name,
+        tv.tv_name,
+        tv.score AS tv_score,
+        tv.scoring_direction
+    FROM employees e
+    LEFT JOIN dim_directorates d ON d.directorate_id = e.directorate_id
+    LEFT JOIN dim_positions p ON p.position_id = e.position_id
+    LEFT JOIN dim_grades g ON g.grade_id = e.grade_id
+    LEFT JOIN tb_tv_scores_long tv ON tv.employee_id = e.employee_id
+),
 
-            -- IMPORTANT: This join must match your actual “tv_scores_long” structure
-            -- Replace with your real table name
-            LEFT JOIN tb_tv_scores_long tv 
-                ON tv.employee_id = e.employee_id
-        ),
+baseline AS (
+    SELECT
+        tv.tv_name,
+        tv.tgv_name,
+        AVG(tv.tv_score) AS baseline_score,
+        STDDEV_POP(tv.tv_score) AS baseline_std
+    FROM tv_raw tv
+    JOIN selected_benchmarks sb ON sb.employee_id = tv.employee_id::text
+    GROUP BY tv.tv_name, tv.tgv_name
+),
 
-        -- 3) Compute baseline for each TV from selected benchmark employees
-        baseline AS (
-            SELECT
-                tv.tv_name,
-                tv.tgv_name,
-                AVG(tv.tv_score) AS baseline_score,
-                STDDEV_POP(tv.tv_score) AS baseline_std
-            FROM tv_raw tv
-            JOIN selected_benchmarks sb ON sb.employee_id = tv.employee_id::text
-            GROUP BY tv.tv_name, tv.tgv_name
-        ),
+tv_match AS (
+    SELECT
+        tv.employee_id,
+        tv.fullname,
+        tv.directorate,
+        tv.role,
+        tv.grade,
+        tv.tgv_name,
+        tv.tv_name,
+        tv.tv_score AS user_score,
+        b.baseline_score,
+        b.baseline_std,
+        tv.scoring_direction,
 
-        -- 4) Compute TV Match Rate for every employee × TV
-        tv_match AS (
-            SELECT
-                tv.employee_id,
-                tv.fullname,
-                tv.directorate,
-                tv.role,
-                tv.grade,
-                tv.tgv_name,
-                tv.tv_name,
-                tv.tv_score AS user_score,
-                b.baseline_score,
-                b.baseline_std,
-                tv.scoring_direction,
+        CASE
+            WHEN b.baseline_score IS NULL THEN NULL
+            WHEN tv.scoring_direction = 'lower-is-better'
+                THEN LEAST(
+                    ((2 * b.baseline_score - tv.tv_score) / NULLIF(b.baseline_score,0)) * 100,
+                    100
+                )
+            ELSE LEAST(
+                (tv.tv_score / NULLIF(b.baseline_score,0)) * 100,
+                100
+            )
+        END AS tv_match_rate
+    FROM tv_raw tv
+    LEFT JOIN baseline b ON b.tv_name = tv.tv_name
+),
 
-                CASE
-                    WHEN b.baseline_score IS NULL THEN NULL
+tgv_match AS (
+    SELECT
+        employee_id,
+        fullname,
+        directorate,
+        role,
+        grade,
+        tgv_name,
+        AVG(tv_match_rate) AS tgv_match_rate
+    FROM tv_match
+    GROUP BY 
+        employee_id, fullname, directorate, role, grade, tgv_name
+),
 
-                    -- Direction: lower-is-better
-                    WHEN tv.scoring_direction = 'lower-is-better'
-                        THEN LEAST(
-                            ((2 * b.baseline_score - tv.tv_score) / NULLIF(b.baseline_score,0)) * 100,
-                            100
-                        )
+final_match AS (
+    SELECT
+        employee_id,
+        fullname,
+        directorate,
+        role,
+        grade,
+        AVG(tgv_match_rate) AS final_match_rate
+    FROM tgv_match
+    GROUP BY employee_id, fullname, directorate, role, grade
+)
 
-                    -- Standard ratio match
-                    ELSE LEAST(
-                        (tv.tv_score / NULLIF(b.baseline_score,0)) * 100,
-                        100
-                    )
-                END AS tv_match_rate
-            FROM tv_raw tv
-            LEFT JOIN baseline b
-                ON b.tv_name = tv.tv_name
-        ),
+SELECT
+    tv.employee_id,
+    tv.fullname,
+    tv.directorate,
+    tv.role,
+    tv.grade,
+    tv.tgv_name,
+    tv.tv_name,
+    tv.user_score,
+    tv.baseline_score,
+    tv.tv_match_rate,
+    tgv.tgv_match_rate,
+    fm.final_match_rate
+FROM tv_match tv
+LEFT JOIN tgv_match tgv
+    ON tgv.employee_id = tv.employee_id
+    AND tgv.tgv_name = tv.tgv_name
+LEFT JOIN final_match fm
+    ON fm.employee_id = tv.employee_id
 
-        -- 5) Aggregate TVs → TGV
-        tgv_match AS (
-            SELECT
-                employee_id,
-                fullname,
-                directorate,
-                role,
-                grade,
-                tgv_name,
-                AVG(tv_match_rate) AS tgv_match_rate
-            FROM tv_match
-            GROUP BY 
-                employee_id, fullname, directorate, role, grade, tgv_name
-        ),
+ORDER BY tv.employee_id, tv.tgv_name, tv.tv_name;
+"""
 
-        -- 6) Final weighted match (equal weight per TGV)
-        final_match AS (
-            SELECT
-                employee_id,
-                fullname,
-                directorate,
-                role,
-                grade,
-                AVG(tgv_match_rate) AS final_match_rate
-            FROM tgv_match
-            GROUP BY employee_id, fullname, directorate, role, grade
-        )
-
-        -- 7) Combine final + tv_data for analytics
-        SELECT
-            tv.employee_id,
-            tv.fullname,
-            tv.directorate,
-            tv.role,
-            tv.grade,
-            tv.tgv_name,
-            tv.tv_name,
-            tv.user_score,
-            tv.baseline_score,
-            tv.tv_match_rate,
-            tgv.tgv_match_rate,
-            fm.final_match_rate
-        FROM tv_match tv
-        LEFT JOIN tgv_match tgv
-            ON tgv.employee_id = tv.employee_id
-            AND tgv.tgv_name = tv.tgv_name
-        LEFT JOIN final_match fm
-            ON fm.employee_id = tv.employee_id
-
-        ORDER BY tv.employee_id, tv.tgv_name, tv.tv_name;
-        """
-
-        try:
-            df = pd.read_sql(sql, self.conn, params={'vacancy_id': vacancy_id})
-            return df
-
-        except Exception as e:
-            print("SQL ERROR:", e)
-            return pd.DataFrame()
+    try:
+        df = pd.read_sql(sql, self.conn, params={'vacancy_id': vacancy_id})
+        return df
+    except Exception as e:
+        print("SQL ERROR:", e)
+        return pd.DataFrame()
 
 
     # ---------------------------------------------
