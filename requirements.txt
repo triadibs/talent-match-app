@@ -4,8 +4,9 @@ numpy
 plotly
 requests
 sqlalchemy
-psycopg-binary
+psycopg3-binary
 python-dotenv
+
 
 
 
