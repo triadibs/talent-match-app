@@ -164,7 +164,8 @@ class DatabaseManager:
     def run_matching_query(self, vacancy_id: int) -> pd.DataFrame:
         """
         Full SQL pipeline for Talent Match Step 2.
-        Always returns detailed TGV + TV rows for analytics.
+        Returns detailed TGV + TV rows for analytics.
+        This version is robust to employee_id format differences between tables.
         """
 
         sql = """
@@ -183,26 +184,38 @@ WITH vacancy AS (
 selected_benchmarks AS (
     SELECT 
         v.job_vacancy_id,
-        (jsonb_array_elements_text(v.selected_talent_ids))::text AS employee_id
+        (jsonb_array_elements_text(v.selected_talent_ids))::text AS selected_id,
+        -- normalized variant with EMP prefix if missing
+        CASE
+            WHEN (jsonb_array_elements_text(v.selected_talent_ids))::text LIKE 'EMP%' THEN (jsonb_array_elements_text(v.selected_talent_ids))::text
+            ELSE CONCAT('EMP', (jsonb_array_elements_text(v.selected_talent_ids))::text)
+        END AS selected_id_norm
     FROM vacancy v
 ),
 
 tv_raw AS (
     SELECT
-        e.employee_id,
+        -- raw employee id from employees (may be numeric or already prefixed)
+        e.employee_id AS emp_id_raw,
         e.fullname,
         d.name AS directorate,
         p.name AS role,
         g.name AS grade,
+        tv.employee_id AS tv_emp_id,       -- from tb_tv_scores_long (has EMP... format)
         tv.tgv_name,
         tv.tv_name,
-        tv.score AS tv_score,
+        tv.tv_score,
         tv.scoring_direction
     FROM employees e
     LEFT JOIN dim_directorates d ON d.directorate_id = e.directorate_id
     LEFT JOIN dim_positions p ON p.position_id = e.position_id
     LEFT JOIN dim_grades g ON g.grade_id = e.grade_id
-    LEFT JOIN tb_tv_scores_long tv ON tv.employee_id = e.employee_id
+    -- robust join: match tv.employee_id to either e.employee_id (if already prefixed) OR 'EMP' || e.employee_id
+    LEFT JOIN tb_tv_scores_long tv
+      ON (
+           tv.employee_id = e.employee_id
+           OR tv.employee_id = CONCAT('EMP', e.employee_id::text)
+         )
 ),
 
 baseline AS (
@@ -212,13 +225,16 @@ baseline AS (
         AVG(tv.tv_score) AS baseline_score,
         STDDEV_POP(tv.tv_score) AS baseline_std
     FROM tv_raw tv
-    JOIN selected_benchmarks sb ON sb.employee_id = tv.employee_id::text
+    JOIN selected_benchmarks sb
+      ON (tv.tv_emp_id IS NOT NULL
+          AND (tv.tv_emp_id = sb.selected_id OR tv.tv_emp_id = sb.selected_id_norm))
     GROUP BY tv.tv_name, tv.tgv_name
 ),
 
 tv_match AS (
     SELECT
-        tv.employee_id,
+        -- use tv_emp_id when available (EMP-prefixed), otherwise build from emp_id_raw
+        COALESCE(tv.tv_emp_id, CONCAT('EMP', tv.emp_id_raw::text)) AS employee_id,
         tv.fullname,
         tv.directorate,
         tv.role,
@@ -229,10 +245,9 @@ tv_match AS (
         b.baseline_score,
         b.baseline_std,
         tv.scoring_direction,
-
         CASE
             WHEN b.baseline_score IS NULL THEN NULL
-            WHEN tv.scoring_direction = 'lower-is-better'
+            WHEN LOWER(tv.scoring_direction) LIKE '%lower%' OR tv.scoring_direction = 'lower-is-better'
                 THEN LEAST(
                     ((2 * b.baseline_score - tv.tv_score) / NULLIF(b.baseline_score,0)) * 100,
                     100
@@ -243,7 +258,7 @@ tv_match AS (
             )
         END AS tv_match_rate
     FROM tv_raw tv
-    LEFT JOIN baseline b ON b.tv_name = tv.tv_name
+    LEFT JOIN baseline b ON b.tv_name = tv.tv_name AND b.tgv_name = tv.tgv_name
 ),
 
 tgv_match AS (
@@ -296,10 +311,26 @@ ORDER BY tv.employee_id, tv.tgv_name, tv.tv_name;
 """
 
         try:
-            df = pd.read_sql(sql, self.get_connection(), params={'vacancy_id': vacancy_id})
+            # Use read_sql to get a DataFrame. Pass connection object from get_connection()
+            with self.get_connection() as conn:
+                df = pd.read_sql(sql, conn, params={'vacancy_id': vacancy_id})
+            # Normalize column names & numeric types for downstream code
+            if 'final_match_rate' in df.columns and 'final_match_rate_percentage' not in df.columns:
+                df = df.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
+            # Ensure percent scale (0..1 -> 0..100)
+            if 'final_match_rate_percentage' in df.columns:
+                df['final_match_rate_percentage'] = pd.to_numeric(df['final_match_rate_percentage'], errors='coerce')
+                maxv = df['final_match_rate_percentage'].max(skipna=True)
+                if pd.notna(maxv) and maxv <= 1.0:
+                    df['final_match_rate_percentage'] = df['final_match_rate_percentage'] * 100.0
+            # Coerce tv_match_rate and tgv_match_rate to numeric
+            for c in ['tv_match_rate', 'tgv_match_rate', 'user_score', 'baseline_score']:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors='coerce')
             return df
         except Exception as e:
-            print("SQL ERROR:", e)
+            # print to logs (Streamlit will show exception in app logs)
+            print("SQL ERROR in run_matching_query:", e)
             return pd.DataFrame()
 
     # ---------------------------------------------
