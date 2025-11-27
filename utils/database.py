@@ -2,14 +2,54 @@
 """
 Database Manager for Talent Match System
 Using psycopg3 with Supabase Pooler
+
+This version is more defensive:
+- execute_query uses cursor.execute + fetchall and builds DataFrame robustly
+- run_matching_query uses cursor -> fetchall, drops header-like rows, trims strings,
+  coerces numeric columns, and normalizes final_match_rate to percentage scale (0..100).
 """
+
+import re
+from typing import List, Dict, Optional, Any
 
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 import pandas as pd
 import streamlit as st
-from typing import List, Dict, Optional
+
+
+def _drop_header_like_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detect rows that literally contain the column names (or empty strings) and drop them.
+    Example problematic row: ['employee_id', 'fullname', 'directorate', ...]
+    """
+    if df.empty:
+        return df
+    cols = list(df.columns)
+
+    def is_header_row(row: pd.Series) -> bool:
+        try:
+            # For each column, consider it header-like if the cell equals the column name or is empty
+            for c in cols:
+                val = row.get(c, "")
+                if pd.isna(val):
+                    val_s = ""
+                else:
+                    val_s = str(val).strip()
+                # If the value equals the column name (case-insensitive) or is empty string -> candidate
+                if val_s == "" or val_s.lower() == str(c).strip().lower():
+                    continue
+                else:
+                    return False
+            return True
+        except Exception:
+            return False
+
+    mask = df.apply(lambda r: is_header_row(r), axis=1)
+    if mask.any():
+        df = df.loc[~mask].reset_index(drop=True)
+    return df
 
 
 class DatabaseManager:
@@ -39,7 +79,10 @@ class DatabaseManager:
             raise ConnectionError(f"Cannot connect to database: {e}")
 
     def get_connection(self):
-        """Return psycopg3 connection"""
+        """
+        Return psycopg3 connection.
+        Use dict_row so cursor.fetchall() returns list of dicts for easy DataFrame conversion.
+        """
         return psycopg.connect(**self.conn_params, row_factory=dict_row)
 
     # ---------------------------------------------
@@ -47,19 +90,47 @@ class DatabaseManager:
     # ---------------------------------------------
     def execute_query(self, query: str, params: tuple = None, fetch: bool = True) -> pd.DataFrame:
         """Execute SQL query and return results (returns empty DataFrame if no rows)."""
-        with self.get_connection() as conn:
-            with conn.cursor() as cur:
-                if params:
-                    cur.execute(query, params)
-                else:
-                    cur.execute(query)
+        conn = None
+        try:
+            conn = self.get_connection()
+            with conn:
+                with conn.cursor() as cur:
+                    if params:
+                        cur.execute(query, params)
+                    else:
+                        cur.execute(query)
 
-                if fetch:
-                    rows = cur.fetchall()
-                    return pd.DataFrame(rows) if rows else pd.DataFrame()
-                else:
-                    conn.commit()
-                    return pd.DataFrame()
+                    if fetch:
+                        rows = cur.fetchall()
+                        # rows may be list of dicts (dict_row) or list of tuples
+                        if not rows:
+                            # try to return DataFrame with columns if available
+                            try:
+                                cols = [d.name for d in cur.description] if cur.description else []
+                                return pd.DataFrame(columns=cols)
+                            except Exception:
+                                return pd.DataFrame()
+                        # If first row is dict-like, DataFrame(rows) will set columns properly
+                        first = rows[0]
+                        if isinstance(first, dict):
+                            df = pd.DataFrame(rows)
+                        else:
+                            # tuple-like rows: use description to build columns
+                            cols = [d.name if hasattr(d, "name") else d[0] for d in cur.description]
+                            df = pd.DataFrame(rows, columns=cols)
+                        return df
+                    else:
+                        conn.commit()
+                        return pd.DataFrame()
+        except Exception as e:
+            print("execute_query error:", e)
+            return pd.DataFrame()
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
 
     # ---------------------------------------------
     # HOME PAGE QUERIES
@@ -142,32 +213,49 @@ class DatabaseManager:
 
         json_data = Jsonb(weights_config) if weights_config else None
 
-        with self.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    query,
-                    (
-                        role_name,
-                        job_level,
-                        role_purpose,
-                        selected_talent_ids,
-                        json_data,
-                    ),
-                )
-                row = cur.fetchone()
-                conn.commit()
-                return row["job_vacancy_id"]
+        conn = None
+        try:
+            conn = self.get_connection()
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        query,
+                        (
+                            role_name,
+                            job_level,
+                            role_purpose,
+                            selected_talent_ids,
+                            json_data,
+                        ),
+                    )
+                    row = cur.fetchone()
+                    conn.commit()
+                    return row["job_vacancy_id"] if row and "job_vacancy_id" in row else int(row[0])
+        except Exception as e:
+            print("insert_vacancy error:", e)
+            raise
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
 
     # ---------------------------------------------
-    # RUN MATCHING PIPELINE (FINAL FIXED VERSION)
+    # RUN MATCHING PIPELINE (ROBUST VERSION)
     # ---------------------------------------------
     def run_matching_query(self, vacancy_id: int) -> pd.DataFrame:
         """
         Full SQL pipeline for Talent Match Step 2.
         Returns detailed TGV + TV rows for analytics.
-        This version is robust to employee_id format differences between tables.
-        """
 
+        This implementation:
+        - executes via cursor.execute with positional params
+        - builds DataFrame either from dict rows or tuple rows
+        - removes header-like rows
+        - trims string columns
+        - coerces numeric columns and normalizes final_match_rate to percentage scale (0..100)
+        """
         sql = """
 WITH vacancy AS (
     SELECT 
@@ -178,7 +266,7 @@ WITH vacancy AS (
         selected_talent_ids,
         weights_config
     FROM talent_benchmarks
-    WHERE job_vacancy_id = %(vacancy_id)s
+    WHERE job_vacancy_id = %s
 ),
 
 selected_benchmarks AS (
@@ -187,7 +275,7 @@ selected_benchmarks AS (
         (jsonb_array_elements_text(v.selected_talent_ids))::text AS selected_id,
         -- normalized variant with EMP prefix if missing
         CASE
-            WHEN (jsonb_array_elements_text(v.selected_talent_ids))::text LIKE 'EMP%' THEN (jsonb_array_elements_text(v.selected_talent_ids))::text
+            WHEN (jsonb_array_elements_text(v.selected_talent_ids))::text LIKE 'EMP%%' THEN (jsonb_array_elements_text(v.selected_talent_ids))::text
             ELSE CONCAT('EMP', (jsonb_array_elements_text(v.selected_talent_ids))::text)
         END AS selected_id_norm
     FROM vacancy v
@@ -309,29 +397,74 @@ LEFT JOIN final_match fm
 
 ORDER BY tv.employee_id, tv.tgv_name, tv.tv_name;
 """
-
+        conn = None
         try:
-            # Use read_sql to get a DataFrame. Pass connection object from get_connection()
-            with self.get_connection() as conn:
-                df = pd.read_sql(sql, conn, params={'vacancy_id': vacancy_id})
-            # Normalize column names & numeric types for downstream code
+            conn = self.get_connection()
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (vacancy_id,))
+                    rows = cur.fetchall()
+
+                    if not rows:
+                        # return empty DataFrame with expected columns to avoid downstream KeyErrors
+                        cols = [
+                            "employee_id", "fullname", "directorate", "role", "grade",
+                            "tgv_name", "tv_name", "user_score", "baseline_score",
+                            "tv_match_rate", "tgv_match_rate", "final_match_rate_percentage"
+                        ]
+                        return pd.DataFrame(columns=cols)
+
+                    # Build DataFrame depending on row type
+                    first = rows[0]
+                    if isinstance(first, dict):
+                        df = pd.DataFrame(rows)
+                    else:
+                        # tuple-like rows — build columns from cursor.description
+                        try:
+                            cols = [d.name if hasattr(d, "name") else d[0] for d in cur.description]
+                        except Exception:
+                            # fallback: generic names
+                            cols = [f"col_{i}" for i in range(len(first))]
+                        df = pd.DataFrame(rows, columns=cols)
+
+            # Post-processing (outside cursor/conn context)
+            # Normalize column name for final_match_rate
             if 'final_match_rate' in df.columns and 'final_match_rate_percentage' not in df.columns:
                 df = df.rename(columns={'final_match_rate': 'final_match_rate_percentage'})
-            # Ensure percent scale (0..1 -> 0..100)
+
+            # Drop rows that are literal headers (defensive)
+            df = _drop_header_like_rows(df)
+
+            # Trim whitespace for object/string columns
+            for c in df.select_dtypes(include=['object']).columns:
+                df[c] = df[c].astype(str).str.strip()
+
+            # Coerce numeric columns
+            numeric_cols = ['baseline_score', 'user_score', 'tv_match_rate', 'tgv_match_rate', 'final_match_rate_percentage']
+            for c in numeric_cols:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors='coerce')
+
+            # Normalize final_match_rate to 0..100 scale if needed
             if 'final_match_rate_percentage' in df.columns:
-                df['final_match_rate_percentage'] = pd.to_numeric(df['final_match_rate_percentage'], errors='coerce')
                 maxv = df['final_match_rate_percentage'].max(skipna=True)
                 if pd.notna(maxv) and maxv <= 1.0:
                     df['final_match_rate_percentage'] = df['final_match_rate_percentage'] * 100.0
-            # Coerce tv_match_rate and tgv_match_rate to numeric
-            for c in ['tv_match_rate', 'tgv_match_rate', 'user_score', 'baseline_score']:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors='coerce')
+
+            # Reset index for cleanliness
+            df = df.reset_index(drop=True)
+
             return df
+
         except Exception as e:
-            # print to logs (Streamlit will show exception in app logs)
             print("SQL ERROR in run_matching_query:", e)
             return pd.DataFrame()
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
 
     # ---------------------------------------------
     # SUMMARY RESULTS
