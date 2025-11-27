@@ -459,6 +459,12 @@ def show_analytics_page():
     if 'tv_name' in emp_detail.columns:
         emp_detail['tv_name'] = emp_detail['tv_name'].astype(object).where(~emp_detail['tv_name'].isna(), other=np.nan)
         emp_detail['tv_name'] = emp_detail['tv_name'].apply(lambda x: x if pd.isna(x) or isinstance(x, str) else str(x))
+        
+        st.subheader("DEBUG — detailed.columns")
+        st.write(list(detailed.columns))
+        
+        st.subheader("DEBUG — detailed (10 baris)")
+        st.write(detailed.head(10))
 
     col1, col2 = st.columns(2)
     with col1:
